@@ -210,17 +210,19 @@ class GitHub:
         # Reconcile an uncertain POST before publishing. Report retry never re-runs Codex.
         comments = self.api(path + '?per_page=100', pages=True)
         existing = next((c for c in comments if c['user']['id'] == CONFIG.bot_user_id and marker in c['body']), None)
-        waiting = row['state'] == 'waiting_for_user'
-        question = (row['detail'][:2200] + '\n\nWaiting for your answer. Reply in this issue with '
-                    '`/murphy continue` followed by your answer. Other queued tasks may run while '
-                    'this session waits.\n\n') if waiting else ''
-        body = (f'{marker}\n[Murphy] Command {row["id"]}: **{row["state"]}**\n\n'
-                + question + f'Thread: `{row["thread_id"] or "none"}`\n'
-                f'Turn: `{row["turn_id"] or "not exposed by CLI"}`\n'
-                f'Execution: `{row["execution_id"]}`\n'
-                f'HEAD: `{row["head"] or "none"}`\n\n'
-                f'Reasoning: `{row["reasoning"] or "CLI default"}`\n\n'
-                + ('' if waiting else row['detail'][:2200]) + '\n\n— Murphy')
+        detail = re.sub(r'^\[(?:Codex|Murphy)\](?:\[(?:DONE|QUESTION|BLOCKER|FINDING|ASSUMPTION)\])?\s*',
+                        '', row['detail'].strip(), flags=re.IGNORECASE)
+        detail = re.sub(r'\n[ \t]*(?:—|--|-)\s*(?:Codex|Murphy)(?:\s*/\s*(?:Codex|Murphy))?'
+                        r'(?:[ \t]*\([^\n)]*\))?[ \t]*$', '', detail, flags=re.IGNORECASE).strip()
+        if row['verb'] in ('pause', 'resume', 'cancel') and row['state'] == 'succeeded':
+            detail = {'pause': 'Queue paused.', 'resume': 'Queue resumed.',
+                      'cancel': f'Cancellation requested for command {row["prompt"]}.'}[row['verb']]
+        if len(detail) > 12000:
+            detail = detail[:12000] + '\n\nReport shortened; the full text is available in `murphy status`.'
+        guidance = ('\n\nReply in this issue with `/murphy continue` followed by your answer. '
+                    'Other queued tasks may run while this session waits.'
+                    if row['state'] == 'waiting_for_user' else '')
+        body = f'{marker}\n{detail}{guidance}'
         if existing:
             self.api(f'repos/{CONFIG.repository}/issues/comments/{existing["id"]}', 'PATCH', {'body': body})
             return existing['id']
@@ -770,6 +772,14 @@ class Worker:
                   'change authentication or touch other projects unless the owner explicitly requested that scope. '
                   'Do not leave background processes running. Earlier bridge-added read-only pilot restrictions are retired; '
                   'honor any explicit read-only instructions from the owner.\n\n'
+                  'For this Murphy invocation, the worker is the sole publisher of operational comments to the triggering issue. '
+                  'Do not post progress, completion reports, blockers or questions yourself through gh or another API. '
+                  'If AGENTS.md or a repository skill requires an issue report, fulfil that requirement by returning '
+                  'the complete report in the final message field; the worker publishes it once. '
+                  'Keep the required substantive details, including PR, commit and QA results, but omit agent-name '
+                  'prefixes, labels such as [Codex][DONE], signatures and internal session/turn/execution IDs. '
+                  'Do not edit repository rules to implement this delegation. Owner-requested issue edits and PR work '
+                  'remain in scope; the delegation covers comments about this execution.\n\n'
                   'Return a final JSON object matching the supplied output schema. '
                   'Use outcome "waiting_for_user" when a decision or information from the owner is needed: '
                   'stop safely, put the concrete question first in message, and do not wait interactively or guess. '

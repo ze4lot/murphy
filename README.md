@@ -133,6 +133,8 @@ When the executor needs an owner decision, it ends its turn with `waiting_for_us
 
 Both new and resumed Codex turns use `--output-schema` with explicit `outcome` (`succeeded` or `waiting_for_user`) and human-readable `message`. Murphy validates the final JSON rather than inferring intent from punctuation. `succeeded` means the requested turn completed, not that the issue was closed or its PR merged. Missing/malformed results become `unknown` and hold the queue for reconciliation. Existing saved sessions use the same result contract on their next continuation.
 
+The worker publishes the turn's report or question once. The executor is instructed to return the complete report in `message`, including repository-required PR, commit and QA details, and to delegate operational issue comments to Murphy even when a repository workflow normally posts them directly. Repository rules do not need editing. Reports omit agent prefixes/signatures and internal session/turn/execution metadata; GitHub already identifies the author. Standard outer `[Codex][DONE]`-style labels and trailing Codex/Murphy signatures are removed without changing report content or examples. Reports over 12000 characters are shortened with a notice; full text and technical details remain in `murphy status` and private logs. Other owner-requested issue edits and PR operations remain available.
+
 ### Reasoning and existing task registration
 
 New sessions default to **high**. Override with exactly one plain line in the issue body, outside code fences/quotes:
@@ -159,7 +161,7 @@ Trusted local operators can use `murphy enqueue TASK start|continue --project OW
 
 Defaults: poll every 30 seconds, execution timeout 600 seconds. While idle Murphy calls GitHub, not a model. Change them with `murphy run --poll-seconds 5 --timeout 180`. `murphy run --once` performs one scheduling pass and runs at most one task.
 
-Commands receive installation-wide IDs, shown in reports and `murphy status`. Newly discovered commands are enrolled by comment creation time/ID; already-enrolled commands keep their durable order. A repository temporarily unavailable to polling retains its cursor and joins the queue on recovery. This is discovery order, not a promise of perfect GitHub-wide chronology during outages.
+Commands receive installation-wide IDs, shown in `murphy status`. Newly discovered commands are enrolled by comment creation time/ID; already-enrolled commands keep their durable order. A repository temporarily unavailable to polling retains its cursor and joins the queue on recovery. This is discovery order, not a promise of perfect GitHub-wide chronology during outages.
 
 If the periodic executor check fails because authentication or the API is unavailable, queued tasks stay queued. Scheduling resumes after a successful check; the normal poll interval also controls these retries.
 

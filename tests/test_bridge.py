@@ -355,10 +355,45 @@ class BridgeTests(unittest.TestCase):
         with patch.object(b.GitHub, 'api', side_effect=[[], {'id': 1001}]) as call:
             self.assertEqual(b.GitHub().report(self.state.row(ident)), 1001)
         body = call.call_args.args[2]['body']
-        self.assertIn('**waiting_for_user**', body)
         self.assertIn('Specify A or B.', body)
         self.assertIn('`/murphy continue`', body)
-        self.assertLess(body.index('Specify A or B.'), body.index('Thread:'))
+        for metadata in ('[Murphy]', 'Thread:', 'Turn:', 'Execution:', 'HEAD:', 'Reasoning:', '— Murphy'):
+            self.assertNotIn(metadata, body)
+
+    def test_report_preserves_full_repo_details_without_agent_labels_or_debug_metadata(self):
+        ident = self.state.enqueue('a', 'start', 'read', item=226)
+        content = ('Implemented: complete fixture change.\n\n' + 'Checked existing behavior.\n' * 120
+                   + '\nPR: https://github.com/example/project/pull/12\nCommit: abcdef123\nQA: pre-commit PASS')
+        report = '[Codex][DONE]\n\n' + content + '\n\n— Codex / Murphy (example-executor)'
+        self.state.finish(ident, 'succeeded', report)
+        with patch.object(b.GitHub, 'api', side_effect=[[], {'id': 1001}]) as call:
+            b.GitHub().report(self.state.row(ident))
+        body = call.call_args.args[2]['body']
+        self.assertIn(content, body)  # Preserve QA/PR details beyond the old 2200-character limit.
+        self.assertTrue(body.startswith('<!-- codex-bridge:' + self.state.row(ident)['execution_id'] + ' -->'))
+        for metadata in ('[Codex]', '[Murphy]', 'Thread:', 'Turn:', 'Execution:', 'HEAD:', 'Reasoning:',
+                         '— Codex', 'example-executor'):
+            self.assertNotIn(metadata, body)
+        self.assertEqual(self.state.row(ident)['detail'], report)
+
+    def test_report_cleanup_preserves_agent_names_and_labels_inside_actual_content(self):
+        ident = self.state.enqueue('a', 'start', 'read', item=226)
+        content = 'Implemented a Murphy setting.\n\n```text\n[Codex][DONE]\n— Murphy\n```'
+        self.state.finish(ident, 'succeeded', '[Codex][DONE]\n\n' + content)
+        with patch.object(b.GitHub, 'api', side_effect=[[], {'id': 1001}]) as call:
+            b.GitHub().report(self.state.row(ident))
+        self.assertIn(content, call.call_args.args[2]['body'])
+
+    def test_oversized_report_is_bounded_and_full_text_remains_in_status(self):
+        ident = self.state.enqueue('a', 'start', 'read', item=226)
+        report = 'Detailed findings.\n' * 1000
+        self.state.finish(ident, 'succeeded', report)
+        with patch.object(b.GitHub, 'api', side_effect=[[], {'id': 1001}]) as call:
+            b.GitHub().report(self.state.row(ident))
+        body = call.call_args.args[2]['body']
+        self.assertLess(len(body), 13000)
+        self.assertIn('Report shortened', body)
+        self.assertEqual(self.state.row(ident)['detail'], report)
 
     def test_dirty_summary_lists_staged_renamed_untracked_and_ignores_contents(self):
         tracked = self.cwd / 'old name.txt'
@@ -709,7 +744,7 @@ class BridgeTests(unittest.TestCase):
         with patch.object(b.GitHub, 'api', side_effect=[[existing], {'id': 1001}]) as call:
             self.assertEqual(b.GitHub().report(row), 1001)
         self.assertEqual(call.call_args_list[1].args[1], 'PATCH')
-        self.assertIn('**blocked**', call.call_args_list[1].args[2]['body'])
+        self.assertIn('Source has uncommitted files: draft.txt', call.call_args_list[1].args[2]['body'])
 
     def test_autostart_without_reasoning_pins_high_for_start_and_continue(self):
         fetch = self.setup_autostart(body='Read HEAD only.')

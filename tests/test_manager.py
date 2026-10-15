@@ -225,8 +225,9 @@ class ManagerTests(unittest.TestCase):
         self.assertNotEqual(json.loads(first.row(1)['plan'])['cwd'], json.loads(second.row(1)['plan'])['cwd'])
         self.manager.reports()
         self.assertEqual({repo for repo, _ in self.reported}, {'example/one', 'example/two'})
-        self.assertTrue(any('Command 1:' in payload['body'] for _, payload in self.reported))
-        self.assertTrue(any('Command 2:' in payload['body'] for _, payload in self.reported))
+        for state in (first, second):
+            self.assertTrue(any('<!-- codex-bridge:' + state.row(1)['execution_id'] + ' -->' in payload['body']
+                                for _, payload in self.reported))
         self.comment('example/two', 103, 'WRITE_TASK_FILE', 'continue')
         self.tick()
         self.assertEqual(second.row(2)['thread_id'], second.row(1)['thread_id'])
@@ -245,7 +246,7 @@ class ManagerTests(unittest.TestCase):
         self.manager.reports()
         self.manager.reports()
         self.assertEqual(len(self.reported), 1)
-        self.assertIn('waiting_for_user', self.reported[0][1]['body'])
+        self.assertIn('Specify which option to use: A or B.', self.reported[0][1]['body'])
         self.manager.close()
         self.manager = Manager(self.root / 'state')
         self.addCleanup(self.manager.close)
@@ -297,7 +298,7 @@ class ManagerTests(unittest.TestCase):
         self.manager.reports()
         self.manager.reports()
         waiting_reports = [(repo, payload) for repo, payload in self.reported
-                           if '**waiting_for_user**' in payload['body']]
+                           if 'Specify which option to use: A or B.' in payload['body']]
         self.assertEqual(len(waiting_reports), 1)
         self.assertEqual(waiting_reports[0][0], 'example/one')
         self.assertEqual(len(list(first.directory.glob('*.jsonl'))), 1)
@@ -424,7 +425,7 @@ class ManagerTests(unittest.TestCase):
         self.manager.reports()
         self.assertEqual(len(self.reported), 1)
         self.assertEqual(self.reported[0][0], 'example/one')
-        self.assertIn('Command 1: **blocked**', self.reported[0][1]['body'])
+        self.assertIn('Source checkout contains uncommitted changes', self.reported[0][1]['body'])
         self.assertIn('draft.txt', self.reported[0][1]['body'])
         self.assertNotIn('private owner contents', self.reported[0][1]['body'])
         other = Manager(self.manager.directory)
