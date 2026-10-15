@@ -80,6 +80,23 @@ def configure(path):
 
 EFFORTS = ('low', 'medium', 'high', 'xhigh', 'max', 'ultra')
 DEFAULT_REASONING = 'high'
+TURN_OUTCOMES = ('succeeded', 'waiting_for_user')
+TURN_SCHEMA = {
+    'type': 'object',
+    'properties': {'outcome': {'type': 'string', 'enum': list(TURN_OUTCOMES)},
+                   'message': {'type': 'string'}},
+    'required': ['outcome', 'message'],
+    'additionalProperties': False,
+}
+
+
+def turn_result(text):
+    result = json.loads(text)
+    if (not isinstance(result, dict) or set(result) != {'outcome', 'message'}
+            or result['outcome'] not in TURN_OUTCOMES or not isinstance(result['message'], str)
+            or not result['message'].strip()):
+        raise ValueError('Expected an explicit outcome and a nonempty message')
+    return result['outcome'], result['message'].strip()
 
 
 def now():
@@ -193,13 +210,17 @@ class GitHub:
         # Reconcile an uncertain POST before publishing. Report retry never re-runs Codex.
         comments = self.api(path + '?per_page=100', pages=True)
         existing = next((c for c in comments if c['user']['id'] == CONFIG.bot_user_id and marker in c['body']), None)
+        waiting = row['state'] == 'waiting_for_user'
+        question = (row['detail'][:2200] + '\n\nWaiting for your answer. Reply in this issue with '
+                    '`/murphy continue` followed by your answer. Other queued tasks may run while '
+                    'this session waits.\n\n') if waiting else ''
         body = (f'{marker}\n[Murphy] Command {row["id"]}: **{row["state"]}**\n\n'
-                f'Thread: `{row["thread_id"] or "none"}`\n'
+                + question + f'Thread: `{row["thread_id"] or "none"}`\n'
                 f'Turn: `{row["turn_id"] or "not exposed by CLI"}`\n'
                 f'Execution: `{row["execution_id"]}`\n'
                 f'HEAD: `{row["head"] or "none"}`\n\n'
                 f'Reasoning: `{row["reasoning"] or "CLI default"}`\n\n'
-                + row['detail'][:2200] + '\n\n— Murphy')
+                + ('' if waiting else row['detail'][:2200]) + '\n\n— Murphy')
         if existing:
             self.api(f'repos/{CONFIG.repository}/issues/comments/{existing["id"]}', 'PATCH', {'body': body})
             return existing['id']
@@ -591,7 +612,7 @@ class Worker:
     def reports(self):
         if not self.github or time.monotonic() < self.report_retry_after:
             return
-        rows = self.state.db.execute("SELECT * FROM commands WHERE state IN ('blocked','succeeded','failed','cancelled','unknown') AND item IS NOT NULL AND report_id IS NULL ORDER BY id").fetchall()
+        rows = self.state.db.execute("SELECT * FROM commands WHERE state IN ('waiting_for_user','blocked','succeeded','failed','cancelled','unknown') AND item IS NOT NULL AND report_id IS NULL ORDER BY id").fetchall()
         for row in rows:
             try:
                 report_id = self.github.report(row)
@@ -732,15 +753,16 @@ class Worker:
             self.state.finish(row['id'], 'unknown', f'Execution outcome uncertain: {error}')
 
     def run_codex(self, row, task, before, fd):
+        schema_path = self.state.directory / 'turn-result.schema.json'
+        schema_path.write_text(json.dumps(TURN_SCHEMA))
         args = [self.codex, 'exec', '--ignore-user-config', '--json'] + permission_args(before)
         if task['model']:
             args += ['--model', task['model']]
         if task['reasoning']:
             args += ['--config', 'model_reasoning_effort=' + json.dumps(task['reasoning'])]
         if task['thread_id']:
-            args += ['resume', task['thread_id'], '-']
-        else:
-            args += ['-']
+            args += ['resume', task['thread_id']]
+        args += ['--output-schema', str(schema_path), '-']
         prompt = ('Carry out the authenticated owner task in this assigned worktree. You may edit project files, '
                   'run relevant tests, commit, push the task branch, and open or update its pull request when the task calls for it. '
                   "Follow this repository's AGENTS.md and use its configured agent identity. "
@@ -748,6 +770,12 @@ class Worker:
                   'change authentication or touch other projects unless the owner explicitly requested that scope. '
                   'Do not leave background processes running. Earlier bridge-added read-only pilot restrictions are retired; '
                   'honor any explicit read-only instructions from the owner.\n\n'
+                  'Return a final JSON object matching the supplied output schema. '
+                  'Use outcome "waiting_for_user" when a decision or information from the owner is needed: '
+                  'stop safely, put the concrete question first in message, and do not wait interactively or guess. '
+                  'Use outcome "succeeded" only when the work requested by this command is complete. '
+                  'The outcome describes this turn, not issue closure, merge or deployment. '
+                  'Use message for the human-readable question or completion report.\n\n'
                   + 'Configured Git executable: ' + json.dumps(CONFIG.git)
                   + '\nConfigured GitHub CLI executable: ' + json.dumps(CONFIG.gh)
                   + '\nRegistered branch: ' + task['branch'] + '\n\nOwner command:\n' + row['prompt'])
@@ -861,7 +889,12 @@ class Worker:
             state = 'cancelled' if self.state.row(row['id'])['cancel'] or self.stop else 'unknown'
             self.state.finish(row['id'], state, 'Execution stopped and all descendants drained; inspect logs before any retry')
         elif child.returncode == 0 and completed and not failed and thread:
-            self.state.finish(row['id'], 'succeeded', final)
+            try:
+                outcome, message = turn_result(final)
+            except (ValueError, TypeError) as error:
+                self.state.finish(row['id'], 'unknown', f'Invalid turn result; inspect logs before resuming: {error}')
+            else:
+                self.state.finish(row['id'], outcome, message)
         else:
             self.state.finish(row['id'], 'unknown', f'CLI exit={child.returncode}, completed={completed}, failed={failed}; inspect {err_path.name}')
 

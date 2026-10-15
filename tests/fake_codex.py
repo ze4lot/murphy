@@ -2,6 +2,7 @@
 """Test-only CLI double. Its executions never call a model."""
 import json
 import os
+from pathlib import Path
 import subprocess
 import sys
 import time
@@ -15,6 +16,8 @@ def emit(kind, **data):
 
 emit('thread.started', thread_id=thread, argv=sys.argv, prompt=prompt)
 emit('turn.started', turn_id=str(uuid.uuid4()))
+schema = json.loads(Path(sys.argv[sys.argv.index('--output-schema') + 1]).read_text())
+assert set(schema['properties']['outcome']['enum']) == {'succeeded', 'waiting_for_user'}
 if 'ASSERT_EXECUTOR_ENV' in prompt:
     user = json.loads(subprocess.check_output(['gh', 'api', '--hostname', 'github.com', 'user'], text=True))
     identity = subprocess.check_output(['git', 'var', 'GIT_AUTHOR_IDENT'], text=True)
@@ -55,5 +58,13 @@ if 'SWITCH_TASK_BRANCH' in prompt:
 
     subprocess.run(['git', 'switch', '-qc', 'codex/unexpected'], check=True)
 
-emit('item.completed', item={'type': 'agent_message', 'text': 'Pilot output; thread ' + thread})
+result = {'outcome': 'succeeded', 'message': 'Pilot output; thread ' + thread}
+if 'ASK_OWNER' in prompt:
+    result = {'outcome': 'waiting_for_user', 'message': 'Specify which option to use: A or B.'}
+if 'SUCCESS_WITH_QUESTION_MARK' in prompt:
+    result['message'] = 'Verified handling of the question mark: ?'
+text = json.dumps(result)
+if 'INVALID_TURN_RESULT' in prompt:
+    text = 'Which option should I use?'
+emit('item.completed', item={'type': 'agent_message', 'text': text})
 emit('turn.completed')

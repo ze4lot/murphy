@@ -83,12 +83,12 @@ class ManagerTests(unittest.TestCase):
             return comments
         if path.startswith(prefix + '/comments/'):
             return next(c for c in comments if c['id'] == int(path.rsplit('/', 1)[1]))
-        if path == prefix + '/7/parent':
+        if b.re.fullmatch(b.re.escape(prefix) + r'/[1-9][0-9]*/parent', path):
             return None
-        if path == prefix + '/7':
-            return {'number': 7, 'title': 'Task', 'body': 'Implement this issue.', 'state': 'open',
+        if b.re.fullmatch(b.re.escape(prefix) + r'/[1-9][0-9]*', path):
+            return {'number': int(path.rsplit('/', 1)[1]), 'title': 'Task', 'body': 'Implement this issue.', 'state': 'open',
                     'updated_at': b.now(), 'url': 'https://api.github.com/' + path}
-        if path.startswith(prefix + '/7/comments'):
+        if b.re.fullmatch(b.re.escape(prefix) + r'/[1-9][0-9]*/comments(?:\?.*)?', path):
             if method == 'POST':
                 self.reported.append((repository, payload))
                 return {'id': 9000 + len(self.reported)}
@@ -110,9 +110,9 @@ class ManagerTests(unittest.TestCase):
         self.manager.add(repository, source)
         return self.manager.projects[number]
 
-    def comment(self, repository, ident, prompt='read', verb='start', author=3001):
+    def comment(self, repository, ident, prompt='read', verb='start', author=3001, item=7):
         comment = {'id': ident, 'body': f'/murphy {verb}\n{prompt}',
-                   'issue_url': 'https://api.github.com/repos/' + repository + '/issues/7',
+                   'issue_url': f'https://api.github.com/repos/{repository}/issues/{item}',
                    'created_at': '2026-10-15T12:00:00Z', 'updated_at': '2026-10-15T12:00:00Z',
                    'user': {'id': author, 'type': 'User'}}
         self.comments[repository].append(comment)
@@ -231,6 +231,77 @@ class ManagerTests(unittest.TestCase):
         self.tick()
         self.assertEqual(second.row(2)['thread_id'], second.row(1)['thread_id'])
         self.assertEqual(second.row(2)['state'], 'succeeded')
+        self.assertIs(b.CONFIG, self.previous)
+
+    def test_waiting_issue_survives_restart_and_answer_queues_behind_active_issue(self):
+        _, state, _ = self.add_project('one', 1)
+        self.comment('example/one', 101, 'ASK_OWNER WRITE_TASK_FILE', item=7)
+        self.comment('example/one', 102, 'SLOW', item=8)
+        self.tick()
+        first = state.row(1)
+        self.assertEqual(first['state'], 'waiting_for_user')
+        self.assertEqual(state.row(2)['state'], 'queued')
+        self.assertEqual(self.manager.setting('paused'), '0')
+        self.manager.reports()
+        self.manager.reports()
+        self.assertEqual(len(self.reported), 1)
+        self.assertIn('waiting_for_user', self.reported[0][1]['body'])
+        self.manager.close()
+        self.manager = Manager(self.root / 'state')
+        self.addCleanup(self.manager.close)
+        self.manager.load()
+        _, state, worker = self.manager.projects[1]
+        self.manager.control('resume')  # A generic resume is not an answer/replay.
+        self.assertEqual(state.row(1)['state'], 'waiting_for_user')
+        self.comment('example/one', 103)['body'] = 'Option A.'
+        self.comment('example/one', 104, 'wrong account answer', verb='continue', author=4001)
+        original = worker.poll
+        sent = False
+        def answer_while_other_issue_runs():
+            nonlocal sent
+            if not sent:
+                sent = True
+                self.assertEqual(state.row(2)['state'], 'running')
+                self.comment('example/one', 105, 'Option A. WRITE_TASK_FILE', verb='continue')
+            original()
+        worker.poll = answer_while_other_issue_runs
+        self.tick()
+        self.assertEqual(state.row(2)['state'], 'succeeded')
+        self.assertEqual(state.row(1)['state'], 'waiting_for_user')
+        self.assertEqual(state.row(3)['state'], 'queued')
+        self.assertEqual(state.db.execute('SELECT COUNT(*) FROM commands').fetchone()[0], 3)
+        self.tick()
+        reply = state.row(3)
+        self.assertEqual(reply['state'], 'succeeded')
+        self.assertEqual(reply['thread_id'], first['thread_id'])
+        self.assertNotEqual(state.row(2)['thread_id'], first['thread_id'])
+        self.assertGreaterEqual(reply['started'], state.row(2)['finished'])
+        self.assertEqual(reply['task'], first['task'])
+        self.assertNotEqual(json.loads(first['plan'])['cwd'], json.loads(state.row(2)['plan'])['cwd'])
+        cwd = Path(json.loads(first['plan'])['cwd'])
+        self.assertEqual((cwd / 'task.txt').read_text(), 'task change\ntask change\n')
+        self.assertEqual(self.manager.setting('paused'), '0')
+
+    def test_waiting_report_outage_does_not_replay_or_hold_another_project(self):
+        _, first, worker = self.add_project('one', 1)
+        _, second, _ = self.add_project('two', 2)
+        self.comment('example/one', 101, 'ASK_OWNER')
+        self.comment('example/two', 102)
+        self.tick()
+        with patch.object(worker.github, 'report', side_effect=RuntimeError('network outage')):
+            self.tick()
+        self.assertEqual(first.row(1)['state'], 'waiting_for_user')
+        self.assertEqual(second.row(1)['state'], 'succeeded')
+        self.assertIsNone(first.row(1)['report_id'])
+        worker.report_retry_after = 0
+        self.manager.reports()
+        self.manager.reports()
+        waiting_reports = [(repo, payload) for repo, payload in self.reported
+                           if '**waiting_for_user**' in payload['body']]
+        self.assertEqual(len(waiting_reports), 1)
+        self.assertEqual(waiting_reports[0][0], 'example/one')
+        self.assertEqual(len(list(first.directory.glob('*.jsonl'))), 1)
+        self.assertEqual(self.manager.setting('paused'), '0')
         self.assertIs(b.CONFIG, self.previous)
 
     def test_only_launch_account_commands_and_new_unedited_comments(self):

@@ -298,6 +298,68 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(self.state.row(first)['thread_id'], self.state.row(second)['thread_id'])
         self.assertEqual(self.state.setting('paused'), '0')
 
+    def test_turn_result_uses_explicit_outcome_and_rejects_invalid_contracts(self):
+        self.assertEqual(b.turn_result('{"outcome":"waiting_for_user","message":"Specify A or B."}'),
+                         ('waiting_for_user', 'Specify A or B.'))
+        self.assertEqual(b.turn_result('{"outcome":"succeeded","message":"Verified ? handling."}')[0],
+                         'succeeded')
+        for value in ('Which option?', '[]', '{}', '{"outcome":"waiting_for_user","message":" "}',
+                      '{"outcome":"succeeded","message":42}',
+                      '{"outcome":"unexpected","message":"done"}',
+                      '{"outcome":"succeeded","message":"done","extra":true}'):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                b.turn_result(value)
+
+    def test_waiting_turn_keeps_checkpoint_and_frees_the_serial_slot(self):
+        other_cwd = Path(self.temp.name) / 'other-task'
+        b.git(str(self.cwd), 'worktree', 'add', '-qb', 'codex/other-task', str(other_cwd))
+        self.state.register('other', other_cwd, 'codex/other-task')
+        first = self.state.enqueue('a', 'start', 'ASK_OWNER WRITE_TASK_FILE')
+        second = self.state.enqueue('other', 'start', 'SUCCESS_WITH_QUESTION_MARK')
+        self.execute()
+        self.assertEqual(self.state.row(first)['state'], 'waiting_for_user')
+        self.assertEqual(self.state.setting('paused'), '0')
+        self.assertFalse(b.descendants())
+        self.execute()
+        self.assertEqual(self.state.row(second)['state'], 'succeeded')
+        self.assertGreaterEqual(self.state.row(second)['started'], self.state.row(first)['finished'])
+        reply = self.state.enqueue('a', 'continue', 'WRITE_TASK_FILE')
+        self.execute()
+        self.assertEqual(self.state.row(reply)['state'], 'succeeded')
+        self.assertEqual(self.state.row(reply)['thread_id'], self.state.row(first)['thread_id'])
+        self.assertNotEqual(self.state.row(second)['thread_id'], self.state.row(first)['thread_id'])
+        self.assertEqual((self.cwd / 'task.txt').read_text(), 'task change\ntask change\n')
+
+    def test_malformed_turn_result_is_unknown_and_never_guessed_from_question_text(self):
+        first = self.state.enqueue('a', 'start', 'INVALID_TURN_RESULT')
+        second = self.state.enqueue('b', 'start', 'read')
+        self.execute()
+        self.execute()
+        self.assertEqual(self.state.row(first)['state'], 'unknown')
+        self.assertIn('Invalid turn result', self.state.row(first)['detail'])
+        self.assertEqual(self.state.row(second)['state'], 'queued')
+        self.assertEqual(self.state.setting('paused'), '1')
+        self.assertEqual(len(list(self.state.directory.glob('*.jsonl'))), 1)
+
+    def test_waiting_result_does_not_override_timeout_or_undrained_descendants(self):
+        self.worker.timeout = 0.2
+        ident = self.state.enqueue('a', 'start', 'ASK_OWNER DAEMON_FOREVER')
+        self.execute()
+        self.assertEqual(self.state.row(ident)['state'], 'unknown')
+        self.assertEqual(self.state.setting('paused'), '1')
+        self.assertFalse(b.descendants())
+
+    def test_waiting_report_contains_question_and_reply_instructions(self):
+        ident = self.state.enqueue('a', 'start', 'read', item=226)
+        self.state.finish(ident, 'waiting_for_user', 'Specify A or B.')
+        with patch.object(b.GitHub, 'api', side_effect=[[], {'id': 1001}]) as call:
+            self.assertEqual(b.GitHub().report(self.state.row(ident)), 1001)
+        body = call.call_args.args[2]['body']
+        self.assertIn('**waiting_for_user**', body)
+        self.assertIn('Specify A or B.', body)
+        self.assertIn('`/murphy continue`', body)
+        self.assertLess(body.index('Specify A or B.'), body.index('Thread:'))
+
     def test_dirty_summary_lists_staged_renamed_untracked_and_ignores_contents(self):
         tracked = self.cwd / 'old name.txt'
         tracked.write_text('private original contents\n')
@@ -399,6 +461,10 @@ class BridgeTests(unittest.TestCase):
             self.assertIn(str(self.cwd / '.git'), profile)
             self.assertIn('commit, push the task branch', event['prompt'])
             self.assertIn('Configured GitHub CLI executable:', event['prompt'])
+            self.assertIn('--output-schema', args)
+            schema = json.loads(Path(args[args.index('--output-schema') + 1]).read_text())
+            self.assertEqual(schema, b.TURN_SCHEMA)
+            self.assertIn('waiting_for_user', event['prompt'])
 
     def test_timeout_kills_detached_child_before_slot_is_released(self):
         self.worker.timeout = 0.3

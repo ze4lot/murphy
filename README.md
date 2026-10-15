@@ -129,6 +129,10 @@ A new issue gets `codex/issue-<number>-murphy`, its own worktree and a persisten
 
 A continuation resumes the saved UUID and accepts unchanged uncommitted work left by the previous turn. Murphy saves branch/Git directories, HEAD and a fingerprint of index/tracked/untracked changes after each execution. Changes made between turns outside Murphy pause the queue without overwriting them. This detects between-turn changes, not the author of simultaneous human edits. Repeated start fails without replacing a session; continuation without a session fails without inventing one.
 
+When the executor needs an owner decision, it ends its turn with `waiting_for_user` and a concrete question. The saved session, branch/worktree and uncommitted checkpoint stay available; the shared queue moves to other commands with only one active execution at a time. Reply in that issue with `/murphy continue` on the first line and your answer below it. An ordinary comment does not resume work. The continuation joins the existing queue and does not interrupt an active turn. Restarting the worker or running `murphy resume` does not answer the question or replay the waiting turn.
+
+Both new and resumed Codex turns use `--output-schema` with explicit `outcome` (`succeeded` or `waiting_for_user`) and human-readable `message`. Murphy validates the final JSON rather than inferring intent from punctuation. `succeeded` means the requested turn completed, not that the issue was closed or its PR merged. Missing/malformed results become `unknown` and hold the queue for reconciliation. Existing saved sessions use the same result contract on their next continuation.
+
 ### Reasoning and existing task registration
 
 New sessions default to **high**. Override with exactly one plain line in the issue body, outside code fences/quotes:
