@@ -45,5 +45,5 @@ It uses temporary repositories and a CLI double; it does not need real model cal
 - Keep installation identities, executable paths and credentials out of source code. Committed examples must use fictional values; authentication belongs to the external CLI tools.
 - Never commit local installation configs, authentication files, runtime databases, execution logs or session history.
 - Preserve authorization checks, source revalidation, deduplication, durable session bindings and serial execution. Unknown outcomes require explicit reconciliation, not automatic replay.
-- The current Codex adapter is read-only. Expanding execution permissions or adding live side effects requires explicit task scope and suitable verification.
+- The executor can edit, test, commit and push within its assigned task. Preserve the permission profile and task scope; broader filesystem access, merge, deployment or releases require explicit authorization and suitable verification.
 - Keep work inside this repository unless the task explicitly requires another project. Do not reset, clean, delete or mutate another project's checkout or runtime as an incidental part of this work.

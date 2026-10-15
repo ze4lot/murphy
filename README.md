@@ -4,13 +4,15 @@ An experimental local bridge from GitHub issue/PR comments to persistent Codex C
 
 Murphy polls for explicit commands from one configured human account, stores them in SQLite, and executes one operation at a time. A new issue can get a separate branch, worktree and Codex session. Continuations resume the saved session UUID and reasoning setting. Results are posted back to GitHub by a separate bot account.
 
-The current executor is **read-only**. The bridge creates worktrees, writes its own state/logs and publishes reports, but the Codex child is instructed not to edit, commit, push or start background work and is launched with `--sandbox read-only`. This is not yet an autonomous implementation agent.
+The executor can **edit code, run tests, commit, push its task branch, and open or update a PR** when the authenticated owner's task calls for it. It follows the target repository's `AGENTS.md` and explicit task instructions. Merge, deployment, releases and changes to other projects are not implied by a normal implementation request.
+
+Codex runs with a named permission profile extending `:workspace`: the task worktree and its Git metadata are writable, network access is enabled, and interactive approval prompts are disabled. Linked worktrees need access to both their own Git index and the shared Git refs/objects. Murphy grants those metadata directories explicitly, not the source checkout's working files. This uses Codex permission profiles (tested with CLI 0.162.1), without a full-access fallback; see [OpenAI's permission profile documentation](https://learn.chatgpt.com/docs/permissions). External CLI tools still use the credentials and permissions supplied by the installation.
 
 ## Requirements
 
 - Linux/WSL and Python 3.11+; the prototype was tested on Python 3.12. It uses Linux `/proc`, pidfds and child-subreaper support.
 - `git`, GitHub CLI (`gh`) and Codex CLI available locally.
-- A GitHub bot account with access to the configured repository and permission to post issue comments.
+- A GitHub bot account with access to the configured repository, permission to post issue comments, and push/PR access for development tasks. Configure Git authentication/author identity for that agent account as well.
 - A separately authenticated Codex CLI installation. Model access is supplied by the user's own account.
 
 The bridge uses only Python's standard library. No pip/npm installation, application database, Docker stack, webhook receiver or external relay is required. WakeWire is not a dependency.
@@ -46,7 +48,7 @@ Keep authentication in the respective CLI tools, **not in this JSON or the repos
 
 One process is configured for one repository. Its default state directory is `~/.local/state/murphy/<owner>/<repository>`; `--state-dir` can override it. State is pinned to the repository and authorization identities, so a different project cannot silently reuse the same registry or issue numbers. Use a **fresh state directory** for this extracted prototype; unscoped state from earlier private pilots is rejected rather than guessed or migrated.
 
-## Start a read-only pilot
+## Start a task
 
 ```bash
 python3 bridge.py --config config.local.json init
@@ -61,10 +63,12 @@ From the configured human account, post a **new** issue comment:
 
 ```text
 /murphy start
-Read this issue and report the current HEAD. Do not change files.
+Implement the change described in this issue, run the relevant tests and open a draft PR.
 ```
 
 The command belongs on its own first line; instructions begin on the next line. LF/CRLF and incidental spaces around the command are accepted. Inline instructions, quoted commands and four-space/tab code blocks are rejected. Editing an existing comment does not activate it.
+
+For an inspection-only task, explicitly ask for no changes. The bridge no longer imposes a blanket read-only instruction on development tasks. Its prompt supplies the configured Git/GitHub executable paths so the agent can use the installation's intended identity.
 
 For an unregistered open issue, the worker snapshots the title/body and creates `codex/issue-<number>-murphy` in `<state>/worktrees/issue-<number>` before starting a new session. A direct parent with one unambiguous issue-specific open PR can supply its feature branch as the base; otherwise the configured base is used. The source checkout is not switched, cleaned or copied. Existing issue branches/worktree paths stop automatic creation; they are never overwritten or silently adopted. Automatic creation targets issues, not PRs.
 
@@ -72,10 +76,10 @@ To continue, post another comment:
 
 ```text
 /murphy continue
-Recall the previous context and read HEAD again. Do not change files.
+Continue the implementation and address the feedback above.
 ```
 
-A continuation uses the saved session. It never creates a replacement session if the binding is missing. A repeated start fails without replacing the existing session. Issue/PR aliases can be bound to the same task through manual registration.
+A continuation uses the saved session and can resume uncommitted work left by the previous turn. Murphy saves a checkout checkpoint after each execution: branch/Git directories, HEAD, and a fingerprint of tracked/index changes and untracked file contents. Before the next turn it compares the checkout with that checkpoint. Changes made between turns outside Murphy pause the task without overwriting them; unchanged dirty work from the agent is accepted. This detects between-turn changes, not the author of simultaneous human edits during an active turn. Older tasks without a checkpoint must be clean on their first execution with this version. A continuation never creates a replacement session if the binding is missing. A repeated start fails without replacing the existing session. Issue/PR aliases can be bound to the same task through manual registration.
 
 ### Reasoning
 
@@ -105,7 +109,7 @@ Each `--item` is an issue or PR number in the configured repository. Registratio
 
 One inherited file lock at `~/.local/state/murphy/worker.lock` covers the worker and its Codex descendants, even with different `--state-dir` values. Detached descendants must exit before the slot is released. Only one Murphy worker can run per OS user. This initial version is **not a concurrent multi-repository dispatcher**: use one configured repository/worker at a time. Direct Codex desktop/terminal runs outside Murphy are not governed by this lock.
 
-While idle, the poller only calls GitHub, not a model. Defaults are a 30-second poll interval and a 600-second execution timeout. `run --poll-seconds 5 --timeout 180` changes them; `run --once` performs one scheduling pass. Stop the foreground worker with Ctrl+C; active descendants are cancelled and drained. No service or autostart is installed.
+While idle, the poller only calls GitHub, not a model. Defaults are a 30-second poll interval and a 600-second execution timeout. `run --poll-seconds 5 --timeout 180` changes them; `run --once` performs one scheduling pass. Stop the foreground worker with Ctrl+C; active descendants are cancelled and drained. Partial edits and commits are preserved; cancellation does not roll them back. No service or autostart is installed.
 
 Controller comments must occupy the entire comment:
 
@@ -144,7 +148,7 @@ Resolution changes bookkeeping only. A branch/worktree creation plan is persiste
 
 A trusted local operator can also use `enqueue TASK start|continue --prompt TEXT`; it uses the same queue. `ingest-comment ID` explicitly refetches a comment through the same activation, author and deduplication gates. Neither command is a way to impersonate a GitHub user.
 
-State and logs can contain issue text and model output. Keep them private and outside version control. The tool uses the existing Codex login without copying auth files, removes inherited OpenAI API-key variables from the child, and ignores unrelated Codex user configuration. For CLI versions that omit turn IDs from JSON events, it examines only the registered thread's exact rollout file, verifying its UUID/cwd/source and execution time bounds. An unavailable ID is reported as unavailable.
+State and logs can contain issue text and model output. Keep them private and outside version control. The tool uses the existing Codex login without copying auth files, removes inherited OpenAI API-key variables from the child, and ignores unrelated Codex user configuration. Permission and approval settings are passed explicitly on both start and resume. For CLI versions that omit turn IDs from JSON events, it examines only the registered thread's exact rollout file, verifying its UUID/cwd/source and execution time bounds. An unavailable ID is reported as unavailable.
 
 ## Development
 
@@ -154,7 +158,15 @@ python3 tests/test_bridge.py
 
 Tests use temporary Git repositories/worktrees and an executable CLI double. They do not call a real model, publish GitHub comments or need your installation config/authentication. Process tests require Linux. The core was exercised locally with Python 3.12 and Codex CLI 0.162.1; broader version/platform compatibility is not qualified.
 
-The initial scope is intentionally small: one configured repository, explicit human commands, a durable serial queue and a read-only Codex adapter. Writable execution, automated implementation/QA/deployment, a local broker, a dashboard and service packaging belong to future work.
+For an optional check against your installed Codex sandbox, without a model call or GitHub write:
+
+```bash
+python3 tests/check_sandbox.py --codex codex
+```
+
+It checks real worktree editing, a Git commit, local HTTP access and protection of a sibling source checkout. The ordinary behavior suite also exercises real local edits/commits and a push to a temporary bare repository through the CLI double. A real-model pilot verified start→uncommitted edit→continue→test→commit in one native session; it did not publish a GitHub PR or push to a real remote.
+
+The current scope is one configured repository, explicit human commands, a durable serial queue and a development-capable Codex executor. Automatic merge/deployment, a local broker, a dashboard and service packaging belong to future work.
 
 ## License
 

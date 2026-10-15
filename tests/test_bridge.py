@@ -291,11 +291,100 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(self.state.row(bad)['state'], 'unknown')
         self.assertEqual(self.state.db.execute("SELECT thread_id FROM tasks WHERE name='a'").fetchone()[0], original)
 
-    def test_checkout_change_is_preserved_and_blocks_execution(self):
-        ident = self.state.enqueue('a', 'start', 'CHANGE_CHECKOUT')
+    def test_agent_edits_can_be_continued_without_committing(self):
+        first = self.state.enqueue('a', 'start', 'WRITE_TASK_FILE')
+        second = self.state.enqueue('a', 'continue', 'WRITE_TASK_FILE')
+        self.execute()
+        self.assertEqual(self.state.row(first)['state'], 'succeeded')
+        self.execute()
+        self.assertEqual(self.state.row(second)['state'], 'succeeded')
+        self.assertEqual((self.cwd / 'task.txt').read_text(), 'task change\ntask change\n')
+        self.assertEqual(self.state.row(first)['thread_id'], self.state.row(second)['thread_id'])
+        self.assertEqual(self.state.setting('paused'), '0')
+
+    def test_agent_commit_is_accepted_and_report_uses_new_head(self):
+        before = b.checkout(str(self.cwd))['head']
+        ident = self.state.enqueue('a', 'start', 'COMMIT_TASK_FILE')
+        self.execute()
+        row = self.state.row(ident)
+        self.assertEqual(row['state'], 'succeeded')
+        self.assertNotEqual(row['head'], before)
+        self.assertEqual(row['head'], b.checkout(str(self.cwd))['head'])
+        next_turn = self.state.enqueue('a', 'continue', 'COMMIT_TASK_FILE')
+        self.execute()
+        self.assertEqual(self.state.row(next_turn)['state'], 'succeeded')
+        self.assertNotEqual(self.state.row(next_turn)['head'], row['head'])
+
+    def test_agent_can_push_its_commit_to_a_local_bare_repository(self):
+        remote = Path(self.temp.name) / 'remote.git'
+        subprocess.run([b.CONFIG.git, 'init', '--bare', '-q', str(remote)], check=True)
+        ident = self.state.enqueue('a', 'start', 'COMMIT_TASK_FILE PUSH_TASK_BRANCH')
+        with patch.dict(os.environ, {'MURPHY_TEST_REMOTE': str(remote)}):
+            self.execute()
+        row = self.state.row(ident)
+        self.assertEqual(row['state'], 'succeeded')
+        pushed = subprocess.check_output([b.CONFIG.git, '--git-dir', str(remote), 'rev-parse',
+                                         'refs/heads/codex/pilot'], text=True).strip()
+        self.assertEqual(pushed, row['head'])
+
+    def test_external_modification_of_tracked_dirty_contents_blocks_execution(self):
+        self.state.enqueue('a', 'start', 'COMMIT_TASK_FILE')
+        self.execute()
+        self.state.enqueue('a', 'continue', 'WRITE_TASK_FILE')
+        self.execute()
+        (self.cwd / 'task.txt').write_text('external edit to already dirty tracked file')
+        continued = self.state.enqueue('a', 'continue', 'read')
+        self.execute()
+        self.assertEqual(self.state.row(continued)['state'], 'unknown')
+        self.assertEqual(len(list(self.state.directory.glob('*.jsonl'))), 2)
+
+    def test_external_edit_to_an_agent_file_is_preserved_and_blocks_execution(self):
+        self.state.enqueue('a', 'start', 'WRITE_TASK_FILE')
+        self.execute()
+        (self.cwd / 'task.txt').write_text('human edit; same untracked filename')
+        continued = self.state.enqueue('a', 'continue', 'read')
+        self.execute()
+        self.assertEqual(self.state.row(continued)['state'], 'unknown')
+        self.assertEqual((self.cwd / 'task.txt').read_text(), 'human edit; same untracked filename')
+        self.assertEqual(len(list(self.state.directory.glob('*.jsonl'))), 1)
+
+    def test_external_commit_after_a_turn_blocks_execution(self):
+        self.state.enqueue('a', 'start', 'COMMIT_TASK_FILE')
+        self.execute()
+        subprocess.run([b.CONFIG.git, '-C', str(self.cwd), '-c', 'user.name=Test Human',
+                        '-c', 'user.email=human@example.invalid', 'commit', '--allow-empty', '-qm', 'external'], check=True)
+        continued = self.state.enqueue('a', 'continue', 'read')
+        self.execute()
+        self.assertEqual(self.state.row(continued)['state'], 'unknown')
+        self.assertEqual(len(list(self.state.directory.glob('*.jsonl'))), 1)
+
+    def test_agent_branch_switch_still_pauses_and_preserves_changes(self):
+        ident = self.state.enqueue('a', 'start', 'WRITE_TASK_FILE SWITCH_TASK_BRANCH')
         self.execute()
         self.assertEqual(self.state.row(ident)['state'], 'unknown')
-        self.assertEqual((self.cwd / 'unexpected.txt').read_text(), 'preserve me')
+        self.assertEqual(self.state.setting('paused'), '1')
+        self.assertTrue((self.cwd / 'task.txt').exists())
+        self.assertEqual(b.git(str(self.cwd), 'branch', '--show-current'), 'codex/unexpected')
+
+    def test_writable_permission_arguments_and_prompt_apply_to_start_and_resume(self):
+        first = self.state.enqueue('a', 'start', 'read')
+        second = self.state.enqueue('a', 'continue', 'read')
+        self.execute()
+        self.execute()
+        for ident in (first, second):
+            row = self.state.row(ident)
+            event = json.loads((self.state.directory / (row['execution_id'] + '.jsonl')).read_text().splitlines()[0])
+            args = event['argv']
+            self.assertIn('default_permissions="murphy"', args)
+            self.assertIn('approval_policy="never"', args)
+            self.assertNotIn('read-only', args)
+            self.assertNotIn('danger-full-access', args)
+            profile = next(arg for arg in args if arg.startswith('permissions.murphy='))
+            self.assertIn('extends = ":workspace"', profile)
+            self.assertIn('network = { enabled = true }', profile)
+            self.assertIn(str(self.cwd / '.git'), profile)
+            self.assertIn('commit, push the task branch', event['prompt'])
+            self.assertIn('Configured GitHub CLI executable:', event['prompt'])
 
     def test_timeout_kills_detached_child_before_slot_is_released(self):
         self.worker.timeout = 0.3
@@ -629,7 +718,19 @@ class BridgeTests(unittest.TestCase):
             if effort:
                 self.assertIn('model_reasoning_effort="high"', event['argv'])
             else:
-                self.assertNotIn('--config', event['argv'])
+                self.assertFalse(any(arg.startswith('model_reasoning_effort=') for arg in event['argv']))
+
+    def test_legacy_task_without_checkpoint_can_start_clean_but_not_dirty(self):
+        with self.state.db:
+            self.state.db.execute('UPDATE tasks SET checkout_json=NULL')
+        started = self.state.enqueue('a', 'start', 'read')
+        self.execute()
+        self.assertEqual(self.state.row(started)['state'], 'succeeded')
+        self.assertIsNotNone(self.state.db.execute("SELECT checkout_json FROM tasks WHERE name='a'").fetchone()[0])
+        (self.cwd / 'human.txt').write_text('preserve')
+        other = self.state.enqueue('b', 'start', 'read')
+        self.execute()
+        self.assertEqual(self.state.row(other)['state'], 'unknown')
 
     def test_new_worker_restores_pending_queue(self):
         ident = self.state.enqueue('a', 'start', 'read')

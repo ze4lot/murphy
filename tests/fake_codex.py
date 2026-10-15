@@ -29,7 +29,21 @@ if 'DESCENDANT' in prompt:
 if 'DAEMON_FOREVER' in prompt:
     subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'], start_new_session=True,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=False)
-if 'CHANGE_CHECKOUT' in prompt:
-    open('unexpected.txt', 'w').write('preserve me')
+if 'WRITE_TASK_FILE' in prompt or 'COMMIT_TASK_FILE' in prompt:
+    if 'default_permissions="murphy"' not in sys.argv or any(arg in sys.argv for arg in ('read-only', 'danger-full-access')):
+        emit('error', message='Writable task permissions were not passed')
+        sys.exit(1)
+    with open('task.txt', 'a') as handle:
+        handle.write('task change\n')
+if 'COMMIT_TASK_FILE' in prompt:
+    subprocess.run(['git', 'add', 'task.txt'], check=True)
+    subprocess.run(['git', '-c', 'user.name=Test Bot', '-c', 'user.email=bot@example.invalid',
+                    'commit', '-qm', 'task implementation'], check=True, stdout=subprocess.DEVNULL)
+if 'PUSH_TASK_BRANCH' in prompt:
+    subprocess.run(['git', 'push', '-q', os.environ['MURPHY_TEST_REMOTE'], 'HEAD:refs/heads/codex/pilot'], check=True)
+if 'SWITCH_TASK_BRANCH' in prompt:
+
+    subprocess.run(['git', 'switch', '-qc', 'codex/unexpected'], check=True)
+
 emit('item.completed', item={'type': 'agent_message', 'text': 'Pilot output; thread ' + thread})
 emit('turn.completed')
