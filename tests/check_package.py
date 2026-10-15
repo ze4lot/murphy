@@ -13,7 +13,7 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parent.parent
 VERSION = '0.1.0'
-MODULES = {'murphy/' + name for name in ('__init__.py', '__main__.py', 'bridge.py', 'cli.py', 'manager.py')}
+MODULES = {'murphy/' + name for name in ('__init__.py', '__main__.py', 'auth.py', 'bridge.py', 'cli.py', 'manager.py')}
 SOURCE = MODULES | {'README.md', 'LICENSE', 'CHANGELOG.md', 'RELEASE.md', 'bridge.py', 'config.example.json',
                     'pyproject.toml', 'MANIFEST.in', 'build_backend.py', 'setup.cfg'}
 SOURCE |= {'tests/' + path.name for path in (ROOT / 'tests').glob('*.py')}
@@ -90,6 +90,38 @@ def install(path, root, wheelhouse, env):
     status = json.loads(run([cli, 'status'], root, isolated))
     assert status == {'account': 'example-owner', 'paused': False, 'projects': [], 'commands': []}, status
     assert json.loads(run([cli, 'projects', 'list'], root, isolated)) == []
+    single = json.loads(run([cli, 'auth', 'status'], root, isolated))
+    assert single['mode'] == 'single' and single['owner'] == single['executor']
+    # A separate account uses gh's own private configuration. Exercise installed
+    # login/status/reauthentication and the installed Git helper with a CLI double.
+    dual = root / ('two-account-gh-' + target.name)
+    source = (ROOT / 'tests/fake_gh.py').read_text().split('\n', 1)[1]
+    dual.write_text('#!' + str(python) + '\n' + source)
+    dual.chmod(0o700)
+    human = home / 'gh/user.json'
+    human.parent.mkdir(parents=True, exist_ok=True)
+    human.write_text(json.dumps({'id': 3001, 'login': 'example-owner', 'type': 'User'}))
+    saved_human = human.read_bytes()
+    separate = root / (target.name + '-separate-state')
+    run([cli, '--state-dir', separate, 'init', '--separate-account', '--gh', dual, '--codex', python], root, isolated)
+    status = json.loads(run([cli, '--state-dir', separate, 'auth', 'status'], root, isolated))
+    assert status['mode'] == 'separate' and status['authenticated']
+    assert status['owner']['id'] == 3001 and status['executor']['id'] == 2001
+    helper_script = ('import json,sqlite3,subprocess,sys;from murphy.auth import environment;'
+                     'db=sqlite3.connect(sys.argv[1]);'
+                     's=json.loads(db.execute("SELECT value FROM settings WHERE key=\'account\'").fetchone()[0]);'
+                     'r=subprocess.run(["git","credential","fill"],env=environment(s),'
+                     'input="protocol=https\\nhost=github.com\\n\\n",text=True,capture_output=True);'
+                     'assert r.returncode==0,r.stderr;assert "username=example-executor" in r.stdout')
+    run([python, '-I', '-c', helper_script, separate / 'manager.sqlite'], root, isolated)
+    executor_file = separate / 'auth/executor/user.json'
+    executor_file.unlink()
+    missing_login = subprocess.run([str(cli), '--state-dir', str(separate), 'auth', 'status'], cwd=root,
+                                   env=isolated, capture_output=True, text=True, timeout=20)
+    assert missing_login.returncode == 1 and not json.loads(missing_login.stdout)['authenticated']
+    run([cli, '--state-dir', separate, 'auth', 'login'], root, isolated)
+    assert json.loads(run([cli, '--state-dir', separate, 'auth', 'status'], root, isolated))['authenticated']
+    assert human.read_bytes() == saved_human, 'Executor authentication changed the human gh configuration'
     print('Clean install/help/setup PASS:', path.name)
 
 

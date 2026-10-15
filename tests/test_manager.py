@@ -26,6 +26,7 @@ class ManagerTests(unittest.TestCase):
         self.environment.start()
         self.addCleanup(self.environment.stop)
         self.user = {'id': 3001, 'login': 'example-owner', 'type': 'User'}
+        self.executor = {'id': 2001, 'login': 'example-executor', 'name': 'Example Executor', 'type': 'User'}
         self.repos = {}
         self.comments = {}
         self.reported = []
@@ -53,6 +54,8 @@ class ManagerTests(unittest.TestCase):
 
     def account_api(self, account, path, pages=False):
         if path == 'user':
+            if account.settings.get('gh_config_dir'):
+                return dict(self.executor)
             return dict(self.user)
         if path.startswith('user/repos?'):
             return list(self.repos.values())
@@ -64,9 +67,11 @@ class ManagerTests(unittest.TestCase):
         repository = b.CONFIG.repository
         self.assertIn(repository, self.repos)
         if path == 'user':
+            if b.CONFIG.gh_config_dir:
+                return dict(self.executor)
             return dict(self.user)
-        if path == 'users/' + self.user['login']:
-            return dict(self.user)
+        if path == 'users/example-owner':
+            return {'id': 3001, 'login': 'example-owner', 'type': 'User'}
         if path == 'repos/' + repository:
             return self.repos[repository]
         prefix = 'repos/' + repository + '/issues'
@@ -128,6 +133,81 @@ class ManagerTests(unittest.TestCase):
             self.manager.init()
         with self.assertRaisesRegex(ValueError, 'already connected'):
             self.manager.add('example/one', self.root / 'one')
+
+    def separate_manager(self):
+        manager = Manager(self.root / 'separate-state')
+        self.addCleanup(manager.close)
+        with patch('murphy.auth.login') as login:
+            manager.init(gh=sys.executable, codex=FAKE, separate_account=True)
+        self.assertEqual(login.call_count, 1)
+        return manager
+
+    def test_separate_executor_accepts_only_owner_commands_across_projects(self):
+        self.manager = self.separate_manager()
+        config, first, _ = self.add_project('one', 1)
+        _, second, _ = self.add_project('two', 2)
+        self.assertEqual((config.owner_user_id, config.bot_user_id), (3001, 2001))
+        self.comment('example/one', 101, author=2001)
+        self.comment('example/one', 102, 'COMMIT_EXECUTOR_FILE', author=3001)
+        self.comment('example/two', 103, author=3001)
+        # Switching the owner's ordinary gh account must not affect the executor.
+        self.user = {'id': 4001, 'login': 'another-owner', 'type': 'User'}
+        self.tick()
+        self.tick()
+        self.manager.reports()
+        self.assertEqual(first.row(1)['state'], 'succeeded')
+        self.assertEqual(second.row(1)['state'], 'succeeded')
+        self.assertEqual(first.db.execute('SELECT COUNT(*) FROM commands').fetchone()[0], 1)
+        cwd = json.loads(first.row(1)['plan'])['cwd']
+        author = subprocess.check_output(['git', '-C', cwd, 'log', '-1', '--format=%an <%ae>|%cn <%ce>'], text=True)
+        self.assertEqual(author.strip(), 'Example Executor <2001+example-executor@users.noreply.github.com>|'
+                         'Example Executor <2001+example-executor@users.noreply.github.com>')
+        self.assertEqual({repo for repo, _ in self.reported}, {'example/one', 'example/two'})
+        self.assertTrue(self.manager.auth_status()['authenticated'])
+
+    def test_separate_executor_status_and_reauthentication_do_not_rebind_identity(self):
+        manager = self.separate_manager()
+        status = manager.auth_status()
+        self.assertEqual(status['mode'], 'separate')
+        self.assertEqual((status['owner']['id'], status['executor']['id']), (3001, 2001))
+        self.executor['id'] = 2002
+        self.assertFalse(manager.auth_status()['authenticated'])
+        with patch('murphy.auth.login'), self.assertRaisesRegex(ValueError, 'account changed'):
+            manager.login()
+        self.assertEqual(manager.account.settings['user_id'], 2001)
+        self.executor['id'] = 2001
+        with patch('murphy.auth.login') as login:
+            manager.login()
+        self.assertTrue(manager.auth_status()['authenticated'])
+        with b.lock(manager), self.assertRaisesRegex(ValueError, 'already held'):
+            manager.login()
+        self.assertEqual(login.call_count, 1)
+
+    def test_same_account_and_failed_separate_login_are_not_saved(self):
+        other = Manager(self.root / 'failed-setup')
+        self.addCleanup(other.close)
+        self.executor = dict(self.user)
+        with patch('murphy.auth.login'), self.assertRaisesRegex(ValueError, 'different executor'):
+            other.init(gh=sys.executable, codex=FAKE, separate_account=True)
+        self.assertIsNone(other.setting('account'))
+        with patch('murphy.auth.login', side_effect=RuntimeError('login failed')), self.assertRaises(RuntimeError):
+            other.init(gh=sys.executable, codex=FAKE, separate_account=True)
+        self.assertIsNone(other.setting('account'))
+
+    def test_separate_executor_change_during_turn_drains_and_pauses(self):
+        self.manager = self.separate_manager()
+        _, state, worker = self.add_project('one', 1)
+        self.comment('example/one', 101, 'SLOW')
+        original = worker.poll
+        def switch():
+            self.executor['id'] = 2002
+            self.manager.last_identity_check = 0
+            original()
+        worker.poll = switch
+        self.tick()
+        self.assertEqual(state.row(1)['state'], 'unknown')
+        self.assertEqual(self.manager.setting('paused'), '1')
+        self.assertFalse(b.descendants())
 
     def test_two_projects_same_issue_number_keep_sessions_and_global_fifo(self):
         _, first, _ = self.add_project('one', 1)

@@ -2,7 +2,10 @@
 """Optional native Codex sandbox smoke check; no model calls or GitHub writes."""
 import argparse
 import http.server
+import json
+import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -11,6 +14,7 @@ import threading
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from murphy import bridge
+from murphy.auth import environment
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -26,6 +30,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--codex', default='codex')
+    parser.add_argument('--separate-account', action='store_true', help='Use a fictional isolated executor; no real gh login')
     args = parser.parse_args()
     bridge.CONFIG = bridge.Config('example/project', 1001, 2001, 3001, 'example-owner')
     # Keep the sibling outside system temp, which the workspace profile permits writing.
@@ -39,15 +44,36 @@ def main():
         subprocess.run(['git', '-C', str(source), 'worktree', 'add', '-qb', 'codex/check', str(task)], check=True)
         subprocess.run(['git', '-C', str(task), 'remote', 'add', 'origin',
                         'https://github.com/example/project.git'], check=True)
+        if args.separate_account:
+            directory = root / 'executor-gh'
+            directory.mkdir()
+            (directory / 'user.json').write_text(json.dumps({'id': 2001, 'login': 'example-executor', 'type': 'User'}))
+            tools = root / 'tools'
+            tools.mkdir()
+            gh = tools / 'gh'
+            shutil.copyfile(ROOT / 'tests/fake_gh.py', gh)
+            gh.chmod(0o700)
+            bridge.CONFIG = bridge.Config('example/project', 1001, 2001, 3001, 'example-owner', gh=str(gh),
+                                          gh_config_dir=str(directory), git_name='Example Executor',
+                                          git_email='2001+example-executor@users.noreply.github.com')
         before = bridge.checkout(str(task))
         server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         script = '''from pathlib import Path
-import errno,subprocess,sys,urllib.request
+import errno,json,subprocess,sys,urllib.request
 Path('probe.txt').write_text('writable')
 subprocess.run(['git','add','probe.txt'],check=True)
-subprocess.run(['git','-c','user.name=Test Bot','-c','user.email=bot@example.invalid','commit','-qm','sandbox probe'],check=True)
+identity=[] if sys.argv[3] else ['-c','user.name=Test Bot','-c','user.email=bot@example.invalid']
+subprocess.run(['git',*identity,'commit','-qm','sandbox probe'],check=True)
+if sys.argv[3]:
+    author=subprocess.check_output(['git','log','-1','--format=%ae'],text=True).strip()
+    assert author=='2001+example-executor@users.noreply.github.com',author
+    user=json.loads(subprocess.check_output(['gh','api','--hostname','github.com','user'],text=True))
+    assert user['id']==2001,user
+    credentials=subprocess.run(['git','credential','fill'],input='protocol=https\\nhost=github.com\\n\\n',
+                               capture_output=True,text=True,check=True).stdout
+    assert 'username=example-executor' in credentials
 assert urllib.request.urlopen(sys.argv[1],timeout=5).read()==b'network-ok'
 try:
     Path(sys.argv[2]).write_text('wrong')
@@ -58,10 +84,13 @@ else:
 print('PASS: worktree edit, commit, network access, sibling checkout protection')
 '''
         try:
+            env = environment(bridge.CONFIG)
+            if args.separate_account:
+                env['PATH'] = str(tools) + os.pathsep + env['PATH']
             subprocess.run([args.codex, 'sandbox', '--permission-profile', 'murphy',
                             *bridge.permission_args(before), '--cd', str(task), '--', sys.executable,
-                            '-c', script, f'http://127.0.0.1:{server.server_port}', str(source / 'human.txt')],
-                           check=True, timeout=30)
+                            '-c', script, f'http://127.0.0.1:{server.server_port}', str(source / 'human.txt'),
+                            'separate' if args.separate_account else ''], check=True, timeout=30, env=env)
             assert (source / 'human.txt').read_text() == 'preserve'
             assert bridge.checkout(str(task))['head'] != before['head']
         finally:

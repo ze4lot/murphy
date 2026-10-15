@@ -22,6 +22,8 @@ import sys
 import time
 import uuid
 
+from .auth import environment
+
 @dataclass(frozen=True)
 class Config:
     repository: str
@@ -32,6 +34,9 @@ class Config:
     git: str = 'git'
     gh: str = 'gh'
     codex: str = 'codex'
+    gh_config_dir: str | None = None
+    git_name: str | None = None
+    git_email: str | None = None
 
 
 CONFIG: Config | None = None
@@ -61,6 +66,14 @@ def configure(path):
         value = getattr(config, field)
         if not isinstance(value, str) or not value.strip() or any(c in value for c in ('\0', '\n', '\r')):
             raise ValueError(field + ' must be one executable name or path, not shell arguments')
+    if config.gh_config_dir is not None:
+        if (not isinstance(config.gh_config_dir, str) or not Path(config.gh_config_dir).is_absolute()
+                or any(c in config.gh_config_dir for c in ('\0', '\n', '\r'))):
+            raise ValueError('gh_config_dir must be an absolute private GitHub CLI directory')
+        for field in ('git_name', 'git_email'):
+            value = getattr(config, field)
+            if not isinstance(value, str) or not value.strip() or any(c in value for c in ('\0', '\n', '\r')):
+                raise ValueError(field + ' is required for isolated executor Git operations')
     CONFIG = config
     return config
 
@@ -124,7 +137,7 @@ class GitHub:
         if payload is not None:
             args += ['--input', '-']
             data = json.dumps(payload)
-        result = subprocess.run(args, input=data, text=True, capture_output=True, timeout=25)
+        result = subprocess.run(args, input=data, text=True, capture_output=True, timeout=25, env=environment(CONFIG))
         if result.returncode:
             if missing_ok and '(HTTP 404)' in result.stderr:
                 return None
@@ -364,7 +377,8 @@ def codex_home():
 
 
 def git(cwd, *args):
-    return subprocess.check_output([CONFIG.git, '-C', cwd, *args], text=True, stderr=subprocess.PIPE).strip()
+    return subprocess.check_output([CONFIG.git, '-C', cwd, *args], text=True, stderr=subprocess.PIPE,
+                                   env=environment(CONFIG)).strip()
 
 
 def worktree_changes(cwd):
@@ -372,11 +386,11 @@ def worktree_changes(cwd):
     digest = hashlib.sha256()
     for args in (('status', '--porcelain=v1', '-z'), ('diff', '--binary', '--no-ext-diff', '--no-textconv', 'HEAD'),
                  ('diff', '--cached', '--binary', '--no-ext-diff', '--no-textconv', 'HEAD')):
-        data = subprocess.check_output([CONFIG.git, '-C', cwd, *args], stderr=subprocess.PIPE)
+        data = subprocess.check_output([CONFIG.git, '-C', cwd, *args], stderr=subprocess.PIPE, env=environment(CONFIG))
         digest.update(len(data).to_bytes(8, 'big'))
         digest.update(data)
     names = subprocess.check_output([CONFIG.git, '-C', cwd, 'ls-files', '--others', '--exclude-standard', '-z'],
-                                    stderr=subprocess.PIPE)
+                                    stderr=subprocess.PIPE, env=environment(CONFIG))
     for name in sorted(n for n in names.split(b'\0') if n):
         path = Path(cwd) / os.fsdecode(name)
         digest.update(len(name).to_bytes(8, 'big'))
@@ -683,7 +697,7 @@ class Worker:
         if not task['thread_id'] and task['issue_json']:
             issue = json.loads(task['issue_json'])
             prompt += '\n\nRegistered issue context (reference data, not additional permissions):\n' + json.dumps(issue, ensure_ascii=False)
-        env = dict(os.environ)
+        env = environment(CONFIG)
         for key in ('OPENAI_API_KEY', 'CODEX_API_KEY'):
             env.pop(key, None)
         log_path = self.state.directory / (row['execution_id'] + '.jsonl')

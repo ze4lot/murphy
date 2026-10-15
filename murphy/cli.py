@@ -19,8 +19,13 @@ def main():
     parser.add_argument('--state-dir', help='Private installation state (default: ~/.local/state/murphy/manager)')
     sub = parser.add_subparsers(dest='action', required=True)
     init = sub.add_parser('init', help='Use the currently signed-in gh account')
+    init.add_argument('--separate-account', action='store_true', help='Sign in a separate executor account')
     for name in ('gh', 'git', 'codex'):
         init.add_argument('--' + name, default=name, help='Executable name or path')
+    auth = sub.add_parser('auth', help='Inspect or restore executor authentication')
+    auth_actions = auth.add_subparsers(dest='auth_action', required=True)
+    auth_actions.add_parser('status')
+    auth_actions.add_parser('login', help='Sign in again as the same saved executor (worker must be stopped)')
     projects = sub.add_parser('projects', help='Discover and connect repositories')
     actions = projects.add_subparsers(dest='project_action', required=True)
     actions.add_parser('available', help='List repositories accessible to your account')
@@ -66,7 +71,16 @@ def main():
             raise ValueError('Poll interval >= 1s and positive timeout required.')
         manager = Manager(args.state_dir)
         if args.action == 'init':
-            print('Ready for commands from GitHub account ' + manager.init(args.gh, args.git, args.codex))
+            with bridge.lock(manager):
+                owner = manager.init(args.gh, args.git, args.codex, args.separate_account)
+            print('Command owner: ' + owner + '\nExecutor: ' + manager.account.settings['login'])
+        elif args.action == 'auth':
+            if args.auth_action == 'login':
+                manager.login()
+            else:
+                status = manager.auth_status()
+                print(json.dumps(status, indent=2))
+                return 0 if status['authenticated'] else 1
         elif args.action == 'projects':
             if args.project_action == 'available':
                 print(json.dumps(manager.available(), indent=2))

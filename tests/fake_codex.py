@@ -15,6 +15,16 @@ def emit(kind, **data):
 
 emit('thread.started', thread_id=thread, argv=sys.argv, prompt=prompt)
 emit('turn.started', turn_id=str(uuid.uuid4()))
+if 'ASSERT_EXECUTOR_ENV' in prompt:
+    user = json.loads(subprocess.check_output(['gh', 'api', '--hostname', 'github.com', 'user'], text=True))
+    identity = subprocess.check_output(['git', 'var', 'GIT_AUTHOR_IDENT'], text=True)
+    credentials = subprocess.run(['git', 'credential', 'fill'], input='protocol=https\nhost=github.com\n\n',
+                                 capture_output=True, text=True, check=True).stdout
+    if (user['id'] != 2001 or '2001+example-executor@users.noreply.github.com' not in identity
+            or 'username=example-executor' not in credentials or any(os.environ.get(key) for key in
+            ('GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN'))):
+        emit('error', message='Executor did not receive an isolated Git/GitHub identity')
+        sys.exit(1)
 if 'NO_COMPLETION' in prompt:
     sys.exit(0)
 if 'WRONG_THREAD' in prompt:
@@ -29,16 +39,16 @@ if 'DESCENDANT' in prompt:
 if 'DAEMON_FOREVER' in prompt:
     subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'], start_new_session=True,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=False)
-if 'WRITE_TASK_FILE' in prompt or 'COMMIT_TASK_FILE' in prompt:
+if any(marker in prompt for marker in ('WRITE_TASK_FILE', 'COMMIT_TASK_FILE', 'COMMIT_EXECUTOR_FILE')):
     if 'default_permissions="murphy"' not in sys.argv or any(arg in sys.argv for arg in ('read-only', 'danger-full-access')):
         emit('error', message='Writable task permissions were not passed')
         sys.exit(1)
     with open('task.txt', 'a') as handle:
         handle.write('task change\n')
-if 'COMMIT_TASK_FILE' in prompt:
+if 'COMMIT_TASK_FILE' in prompt or 'COMMIT_EXECUTOR_FILE' in prompt:
     subprocess.run(['git', 'add', 'task.txt'], check=True)
-    subprocess.run(['git', '-c', 'user.name=Test Bot', '-c', 'user.email=bot@example.invalid',
-                    'commit', '-qm', 'task implementation'], check=True, stdout=subprocess.DEVNULL)
+    identity = [] if 'COMMIT_EXECUTOR_FILE' in prompt else ['-c', 'user.name=Test Bot', '-c', 'user.email=bot@example.invalid']
+    subprocess.run(['git', *identity, 'commit', '-qm', 'task implementation'], check=True, stdout=subprocess.DEVNULL)
 if 'PUSH_TASK_BRANCH' in prompt:
     subprocess.run(['git', 'push', '-q', os.environ['MURPHY_TEST_REMOTE'], 'HEAD:refs/heads/codex/pilot'], check=True)
 if 'SWITCH_TASK_BRANCH' in prompt:

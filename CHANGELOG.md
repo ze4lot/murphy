@@ -3,7 +3,8 @@
 ## 0.1.0 — experimental candidate
 
 - Installable `murphy` command and Python distribution with no runtime dependencies.
-- Setup from the signed-in GitHub account; only that immutable user ID can issue commands. Reports use the same account.
+- Setup from the signed-in GitHub account; only that immutable owner ID can issue commands. Default same-account execution or optional `init --separate-account` with one separate executor across all projects.
+- Isolated executor GitHub login, process-scoped HTTPS credentials and commit author/committer metadata, with no human-account fallback. `auth status` and same-executor `auth login` recovery; existing installations/sessions are not rebound.
 - Repository discovery, explicit project connection, managed clones or existing checkouts and automatic base/ID detection.
 - Multiple repositories share a persistent serial scheduling order and global controls. Tasks/sessions/checkpoints remain isolated per project.
 - Account revalidation, global handling of uncertain outcomes, retained cancellation/draining and report-only retry.

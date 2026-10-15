@@ -17,3 +17,5 @@ worktrees/
 build/
 dist/
 *.egg-info/
+/auth/
+/checkouts/

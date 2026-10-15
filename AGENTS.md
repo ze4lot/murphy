@@ -33,6 +33,7 @@ Run focused checks while developing. The current local behavior suite is:
 ```bash
 python3 tests/test_bridge.py
 python3 tests/test_manager.py
+python3 tests/test_auth.py
 ```
 
 It uses temporary repositories and a CLI double; it does not need real model calls, GitHub writes or installation credentials. Process tests require Linux.

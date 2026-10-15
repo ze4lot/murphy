@@ -1,4 +1,4 @@
-"""One account, isolated project registries and one durable scheduling order.
+"""One owner, an optional executor account and one durable scheduling order.
 
 The prototype executor remains single-project. Only this serial coordinator
 switches its configuration; scoped calls restore the active project's context
@@ -19,6 +19,7 @@ import sys
 import time
 
 from . import bridge as b
+from . import auth
 
 
 @contextlib.contextmanager
@@ -53,9 +54,11 @@ class Account:
         args = [self.settings['gh'], 'api', '--hostname', 'github.com', path]
         if pages:
             args += ['--paginate', '--slurp']
-        result = subprocess.run(args, text=True, capture_output=True, timeout=25)
+        result = subprocess.run(args, text=True, capture_output=True, timeout=25, env=auth.environment(self.settings))
         if result.returncode:
-            raise RuntimeError('GitHub request failed; check gh auth status and repository permissions: '
+            recovery = ('murphy auth status / murphy auth login' if self.settings.get('gh_config_dir')
+                        else 'gh auth status')
+            raise RuntimeError('GitHub request failed; check ' + recovery + ' and repository permissions: '
                                + result.stderr.strip()[:400])
         value = json.loads(result.stdout)
         return [item for page in value for item in page] if pages else value
@@ -169,20 +172,60 @@ class Manager:
         if self.account is None:
             raise ValueError('Run murphy init first (after gh auth login and codex login).')
 
-    def init(self, gh='gh', git='git', codex='codex'):
+    def init(self, gh='gh', git='git', codex='codex', separate_account=False):
         if self.account is not None:
             raise ValueError('Already initialized. The saved GitHub identity will not be replaced.')
         settings = {'gh': gh, 'git': git, 'codex': codex}
         for executable in settings.values():
             prerequisite(executable)
         account = Account(settings)
-        user = account.current()
-        settings.update(user_id=user['id'], login=user['login'])
+        owner = account.current()
+        user = owner
+        if separate_account:
+            directory = self.directory / 'auth/executor'
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            settings['gh_config_dir'] = str(directory)
+            print('Command owner: ' + owner['login'] + '. Sign in with a DIFFERENT GitHub account for the executor.',
+                  file=sys.stderr)
+            auth.login(settings)
+            user = Account(settings).current()
+            if user['id'] == owner['id']:
+                raise ValueError('Separate-account mode requires a different executor account. '
+                                 'Retry init and choose that account in the browser.')
+            name = user.get('name')
+            if not isinstance(name, str) or not name.strip() or any(c in name for c in ('\0', '\n', '\r')):
+                name = user['login']
+            settings.update(git_name=name,
+                            git_email=f'{user["id"]}+{user["login"]}@users.noreply.github.com')
+        settings.update(user_id=user['id'], login=user['login'], owner_id=owner['id'], owner_login=owner['login'])
         with self.db:
             self.db.execute('INSERT INTO settings VALUES (?, ?)', ('account', json.dumps(settings)))
             self.db.execute('INSERT INTO settings VALUES (?, ?)', ('paused', '0'))
         self.account = Account(settings)
-        return user['login']
+        return owner['login']
+
+    def auth_status(self):
+        self.initialized()
+        settings = self.account.settings
+        result = {'mode': 'separate' if settings.get('gh_config_dir') else 'single',
+                  'owner': {'id': settings.get('owner_id', settings['user_id']),
+                            'login': settings.get('owner_login', settings['login'])},
+                  'executor': {'id': settings['user_id'], 'login': settings['login']}}
+        try:
+            self.account.verify()
+            result['authenticated'] = True
+        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as error:
+            result.update(authenticated=False, error=str(error))
+        return result
+
+    def login(self):
+        self.initialized()
+        if not self.account.settings.get('gh_config_dir'):
+            raise ValueError('Single-account mode uses your normal gh login; run gh auth login.')
+        with b.lock(self):
+            print('Sign in as the saved executor: ' + self.account.settings['login'], file=sys.stderr)
+            auth.login(self.account.settings)
+            self.account.verify()
 
     def load(self):
         self.initialized()
@@ -249,8 +292,11 @@ class Manager:
         if self.db.execute('SELECT 1 FROM projects WHERE id=? OR repository=?', (repo['id'], repository)).fetchone():
             raise ValueError('Project is already connected; its activation boundary has been preserved.')
         settings = self.account.settings
-        config = b.Config(repository, repo['id'], settings['user_id'], settings['user_id'], settings['login'],
-                          git=settings['git'], gh=settings['gh'], codex=settings['codex'])
+        config = b.Config(repository, repo['id'], settings['user_id'],
+                          settings.get('owner_id', settings['user_id']), settings.get('owner_login', settings['login']),
+                          git=settings['git'], gh=settings['gh'], codex=settings['codex'],
+                          gh_config_dir=settings.get('gh_config_dir'), git_name=settings.get('git_name'),
+                          git_email=settings.get('git_email'))
         for tool in (config.git, config.gh, config.codex):
             prerequisite(tool)
         if not base:
@@ -274,10 +320,10 @@ class Manager:
                     if source.exists():
                         raise ValueError('Managed checkout already exists; inspect it and use --checkout explicitly.')
                     source.parent.mkdir(parents=True, exist_ok=True)
-                    # gh uses the selected account and its configured Git protocol.
+                    # The executor's context must also reach gh's Git subprocess.
                     self.account.verify()
                     subprocess.run([config.gh, 'repo', 'clone', 'https://github.com/' + repository, str(source)],
-                                   check=True, timeout=300)
+                                   check=True, timeout=300, env=auth.environment(config))
                 b.checkout(str(source))
                 b.git(str(source), 'check-ref-format', '--branch', base)
                 b.git(str(source), 'fetch', 'origin', base)

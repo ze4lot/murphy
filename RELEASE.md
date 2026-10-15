@@ -11,6 +11,7 @@ python3 -m venv .venv
 .venv/bin/python -m pip install 'build==1.2.2.post1'
 python3 tests/test_bridge.py
 python3 tests/test_manager.py
+python3 tests/test_auth.py
 .venv/bin/python tests/check_package.py
 git diff --check
 SOURCE_DATE_EPOCH=315532800 .venv/bin/python -m build
@@ -24,7 +25,7 @@ Expected artifacts:
 - `dist/murphy_github-0.1.0-py3-none-any.whl`: installable package.
 - `dist/murphy_github-0.1.0.tar.gz`: source archive that can also be installed.
 
-Both must contain the MIT license and fictional example configuration. Inspect the exact files before attaching them anywhere; private installation configuration, credentials, SQLite databases, execution logs, session history and machine-specific identities/paths must be absent. The checker enforces an explicit content allowlist. It installs each artifact outside the source tree in a fresh virtual environment with an empty HOME and no inherited credentials, and verifies CLI help/version, imports, example data and expected setup errors.
+Both must contain the MIT license and fictional example configuration. Inspect the exact files before attaching them anywhere; private installation configuration, credentials (including `auth/executor`), SQLite databases, execution logs, session history and machine-specific identities/paths must be absent. The checker enforces an explicit content allowlist. It installs each artifact outside the source tree in a fresh virtual environment with an empty HOME and no inherited credentials, and verifies CLI help/version, imports, example data and expected setup errors. A CLI double then exercises both account modes, status/reauthentication and the installed Git credential helper without real GitHub access.
 
 ## Review and promotion
 

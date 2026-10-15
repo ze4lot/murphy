@@ -1,6 +1,6 @@
 # Murphy
 
-Murphy lets you work on your GitHub projects by commenting on issues. Install it on Linux/WSL, sign in to GitHub and Codex, connect your repositories and run one local worker. It accepts commands **only from the GitHub account you connected**. The same account posts reports and opens PRs; a separate bot account is unnecessary.
+Murphy lets you work on your GitHub projects by commenting on issues. Install it on Linux/WSL, sign in to GitHub and Codex, connect your repositories and run one local worker. It accepts commands **only from your connected owner account**. By default that account also does the work; optionally sign in a separate executor account for reports, commits, pushes and PRs.
 
 Multiple projects share one durable queue. Murphy runs **one task at a time across all connected repositories**, gives each issue its own branch/worktree and keeps its Codex session for later continuations. It can edit, test, commit, push a task branch and create/update PRs when your instructions call for them. Merge, deployment and releases require separate authorization.
 
@@ -12,7 +12,7 @@ Requirements:
 
 - Linux or WSL2 with Python 3.11+, `/proc` and pidfd support. Local validation uses Python 3.12; CI covers 3.11 and 3.12. Native Windows/macOS are not supported.
 - Git, [GitHub CLI](https://cli.github.com/) and [Codex CLI](https://developers.openai.com/codex/cli/) installed and on your PATH.
-- Your GitHub account has read/write access to the projects you connect, including issue comments, contents and PRs. Its token must also permit those operations. Git fetch/push authentication and author identity must be configured for the same intended account.
+- The executor's GitHub account (your own by default) has read/write access to connected projects, including issue comments, contents and PRs. Its token must also permit those operations. In single-account mode, configure Git fetch/push authentication and author identity for that account. Separate-account mode configures process-scoped HTTPS credentials and commit identity for its executor automatically.
 - An authenticated Codex installation with a model supporting the requested reasoning setting. The executor permission profile was exercised with Codex CLI 0.162.1; other versions are not qualified.
 
 Install from a local checkout of the candidate branch/commit (PyPI publication is a separate step):
@@ -32,7 +32,7 @@ gh auth login
 codex login
 ```
 
-For HTTPS Git access, `gh auth setup-git` can configure Git to use GitHub CLI credentials. For SSH, configure the key for the intended GitHub account. Murphy does not switch your Git identity or copy credentials.
+For single-account HTTPS Git access, `gh auth setup-git` can configure Git to use GitHub CLI credentials. For single-account SSH, configure the intended account's key. Separate-account mode needs neither command nor a separate SSH key; it leaves your normal Git/GitHub settings unchanged.
 
 ## First run and multiple projects
 
@@ -45,7 +45,38 @@ murphy projects list
 murphy run
 ```
 
-`init` reads the currently authenticated **GitHub CLI account**, not your Linux username. Its immutable GitHub user ID becomes the only permitted command author. No manual login or numeric ID fields are needed. The account also publishes reports. `init` detects missing tools and does not replace an existing installation identity.
+`init` reads the currently authenticated **GitHub CLI account**, not your Linux username. Its immutable GitHub user ID becomes the only permitted command author. No manual login or numeric ID fields are needed. Without `--separate-account`, the same account does the work and publishes reports. `init` detects missing tools and does not replace an existing installation identity.
+
+### Optional separate executor account
+
+Instead of plain `init`, choose the separate-account mode when creating an installation:
+
+```bash
+murphy init --separate-account
+murphy auth status
+murphy projects available
+murphy projects add example/api
+murphy run
+```
+
+Murphy first identifies the owner from your normal `gh` login, then opens GitHub CLI's browser login for a **different executor account** in a private configuration. Choose that account in the browser; if your browser is already signed in to your personal account, use the appropriate browser profile/account. Setup displays both detected logins and refuses to save the same account twice. One owner and one executor serve all connected projects; each project still has its own worktrees/sessions and all projects share the queue.
+
+The owner writes `/murphy` comments. The executor reads them, accepts only the saved owner's immutable ID, and publishes reports/PRs. Repository discovery and access checks use the executor's account. Give that account access to each desired repository through GitHub before connecting it. Comments from the executor or other people do not authorize work.
+
+After setup the worker does not need the owner's login or token. Switching/logging out of your ordinary `gh` does not change the owner or affect the separate executor. Murphy supplies the private executor configuration to its own commands and Codex descendants, removes inherited GitHub tokens/credential overrides, and verifies the executor ID before GitHub operations and Git credential retrieval. GitHub operations use HTTPS, including process-only rewriting of recognized GitHub SSH URLs; the source remote URL stays unchanged. Git author/committer metadata uses the executor's public display name (or login) and `ID+LOGIN@users.noreply.github.com`. Older accounts may need to enable the ID-based noreply address in [GitHub email settings](https://docs.github.com/en/account-and-profile/reference/email-addresses-reference) for attribution.
+
+Git credentials come from the executor's `gh` login through a scoped helper. Human credential helpers and system/global Git settings are not loaded for these separate-account processes; repository settings/hooks remain in place. No global Git config or default `gh` login is edited. Use standard `gh`/`git` executables in this mode; custom wrappers must honor the supplied executor environment. A wrapper that forces another account is incompatible.
+
+`murphy auth status` shows the saved owner, executor, mode and current executor authentication (exit 1 on missing/changed authentication). To restore an expired/logged-out executor, stop the worker and run:
+
+```bash
+murphy auth login
+murphy auth status
+```
+
+This reauthenticates the **same saved executor**; it cannot rebind the installation to another account. A changed executor stops work and any uncertain active turn needs the normal reconciliation procedure. There is no fallback to the owner's credentials. To select another owner/executor or switch an existing installation's mode, create a new `--state-dir`; existing tasks, queues and sessions are preserved rather than migrated. Single-account installations restore authentication directly with `gh auth login`.
+
+### Connecting projects
 
 `projects available` lists accessible, active repositories and whether GitHub reports push permission. Only explicitly added repositories are watched. Adding a project obtains its canonical name, numeric ID and default branch from GitHub, checks access and clones it locally through `gh`. It never enables every repository automatically.
 
@@ -65,11 +96,11 @@ murphy init --gh /opt/example/bin/gh-wrapper --git /opt/example/bin/git-wrapper 
 
 These must be executable names or paths, not shell command strings. Settings remain private installation state. The ordinary setup requires no JSON editing. Optional per-project `--base` and `--model` settings are supplied to `projects add`; otherwise GitHub's default branch and Codex's default model are used. There is no project removal/reconfiguration command in this candidate; inspect saved work before creating a separate installation.
 
-The account is revalidated during polling, before source validation and before GitHub reads/writes. A changed account stops the worker; active descendants are drained and an uncertain turn requires reconciliation. Restore the original account before resuming. For another account, initialize a separate `--state-dir`; existing tasks are never silently rebound to it. The global execution lock still prevents overlapping Murphy workers.
+The executor account is revalidated during polling, before source validation and before GitHub reads/writes. In single-account mode this is your ordinary `gh` account; in separate-account mode it is the private executor login. A changed executor stops the worker; active descendants are drained and an uncertain turn requires reconciliation. Restore the original executor before resuming. For another identity pair, initialize a separate `--state-dir`; existing tasks are never silently rebound to it. The global execution lock still prevents overlapping Murphy workers.
 
 ## Give Murphy a task
 
-From the account used for `init`, add a **new issue comment**:
+From the owner account identified at the beginning of `init`, add a **new issue comment**:
 
 ```text
 /murphy start
@@ -150,13 +181,14 @@ Default installation directory: `~/.local/state/murphy/manager`. Supply `--state
 
 | Location relative to installation | Contents |
 | --- | --- |
-| `manager.sqlite` | Connected account/tool settings, projects, durable global command IDs/order and pause flag. |
+| `manager.sqlite` | Saved owner/executor IDs and non-secret tool settings, projects, durable global command IDs/order and pause flag. |
+| `auth/executor/` | Separate-account GitHub CLI configuration, when enabled. gh manages credentials in the system credential store; if unavailable it can store its token here. Keep this directory private. |
 | `checkouts/<repository-id>/` | Managed source clones. |
 | `projects/<repository-id>/state.sqlite` | Project authorization/activation, task/session bindings and execution outcomes. |
 | `projects/<repository-id>/worktrees/` | Automatic task checkouts. |
 | `projects/<repository-id>/*.jsonl`, `*.stderr` | Execution logs; may contain issue text and model output. |
 
-Do not edit SQLite files while Murphy runs. Do not delete state to recover an uncertain turn. Credentials stay in Git/GitHub/Codex tools. Account/tool paths in these databases are local settings, never release contents.
+Do not edit SQLite files while Murphy runs. Do not delete state to recover an uncertain turn. Credentials stay under GitHub/Codex CLI management; Murphy does not store tokens in its databases. GitHub CLI's credential-store/file fallback is described in its [login documentation](https://cli.github.com/manual/gh_auth_login). Treat the entire installation directory, including `auth/executor`, as private and keep it outside Git. Account/tool paths in databases are local settings, never release contents.
 
 Codex gets a named permission profile extending `:workspace`: the assigned task worktree and its Git metadata are writable, network is enabled, interactive approvals are disabled. Shared Git refs/objects need explicit access for linked worktrees; sibling source working files are not granted. Both start/resume receive the same permission settings; there is no full-access fallback. The child uses the existing Codex login without copying auth files, removes inherited OpenAI API-key variables and ignores unrelated Codex user configuration. Task instructions and target `AGENTS.md` still define authorized scope.
 
@@ -171,6 +203,7 @@ Existing scoped prototype databases and saved sessions are not migrated into the
 ```bash
 python3 tests/test_bridge.py
 python3 tests/test_manager.py
+python3 tests/test_auth.py
 python3 -m venv .venv
 .venv/bin/python -m pip install 'build==1.2.2.post1'
 .venv/bin/python tests/check_package.py
@@ -182,9 +215,12 @@ Optional native sandbox check (no model call or GitHub write):
 
 ```bash
 python3 tests/check_sandbox.py --codex codex
+python3 tests/check_sandbox.py --codex codex --separate-account
 ```
 
-A controlled live pilot requires explicit authorization: use a disposable repository with your own credentials, a separate state directory and the intended base. Start with the inspection-only example; verify the report and session, then authorize a small edit/test/commit/PR task and a continuation. Confirm one UUID, isolated worktrees, global serial order across two projects and stop/recovery behavior. Do not publish, merge or deploy as part of this pilot. This release preparation does not claim a new live multi-project pilot was performed.
+The separate-account sandbox check uses fictional GitHub CLI credentials to exercise real worktree editing/committing, scoped Git credential retrieval and GitHub identity reads inside the native sandbox. It makes no model calls or real GitHub requests.
+
+A controlled live pilot requires explicit authorization: use disposable repositories with your own credentials, a separate state directory and the intended base. For separate-account qualification, also use an authorized second account: verify only owner comments trigger work, reports/PRs/pushes belong to the executor, commit attribution matches, and normal human Git/GitHub settings remain unchanged. Start with the inspection-only example; verify the report and session, then authorize a small edit/test/commit/PR task and a continuation. Confirm one UUID, isolated worktrees, global serial order across two projects and stop/recovery behavior. Do not publish, merge or deploy as part of this pilot. This release preparation does not claim a live multi-project/two-account pilot was performed.
 
 Automatic merge/deployment, a broker, dashboard, parallel execution, native Windows support and service packaging are outside this candidate.
 
