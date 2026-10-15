@@ -44,6 +44,7 @@ class ManagerTests(unittest.TestCase):
         api.start()
         self.addCleanup(api.stop)
         original = b.git
+        self.real_git = original
         fetch = patch.object(b, 'git', side_effect=lambda cwd, *args:
                              '' if args[0] == 'fetch' else original(cwd, *args))
         fetch.start()
@@ -292,6 +293,30 @@ class ManagerTests(unittest.TestCase):
         self.tick()
         self.assertEqual(state.row(1)['state'], 'succeeded')
 
+    def test_identity_outage_retains_queued_commands_until_recovery(self):
+        _, first, _ = self.add_project('one', 1)
+        _, second, _ = self.add_project('two', 2)
+        self.comment('example/one', 101)
+        self.comment('example/two', 102)
+        self.manager.pump()
+        order = self.manager.status()['commands']
+        self.manager.last_identity_check = 0
+        with patch.object(self.manager.account, 'verify', side_effect=RuntimeError('executor unavailable')) as verify:
+            self.tick()
+            self.tick()  # The retry interval must not reopen scheduling after a failure.
+            self.assertEqual(verify.call_count, 1)
+        self.assertEqual(first.row(1)['state'], 'queued')
+        self.assertEqual(second.row(1)['state'], 'queued')
+        self.assertFalse(list(first.directory.glob('*.jsonl')))
+        self.assertFalse(list(second.directory.glob('*.jsonl')))
+        self.assertFalse(self.reported)
+        self.manager.last_identity_check = 0
+        self.tick()
+        self.tick()
+        self.assertEqual(first.row(1)['state'], 'succeeded')
+        self.assertEqual(second.row(1)['state'], 'succeeded')
+        self.assertEqual([row['id'] for row in self.manager.status()['commands']], [row['id'] for row in order])
+
     def test_unknown_in_one_project_blocks_all_until_explicit_resolution(self):
         _, first, _ = self.add_project('one', 1)
         _, second, _ = self.add_project('two', 2)
@@ -413,6 +438,45 @@ class ManagerTests(unittest.TestCase):
             self.assertEqual(self.manager.add(repo), repo)
         source = self.manager.directory / 'checkouts/2'
         self.assertTrue((source / '.git').is_dir())
+
+    def test_single_branch_checkout_fetches_and_refreshes_explicit_task_base(self):
+        self.add_project('seed', 1)
+        seed = self.root / 'seed'
+        remote = self.root / 'remote.git'
+        source = self.root / 'single'
+        subprocess.run(['git', 'clone', '--bare', '-q', str(seed), str(remote)], check=True)
+        subprocess.run(['git', '-C', str(seed), 'switch', '-qc', 'develop'], check=True)
+        subprocess.run(['git', '-C', str(seed), 'push', '-q', str(remote), 'develop'], check=True)
+        subprocess.run(['git', 'clone', '-q', '--single-branch', '--branch', 'main', str(remote), str(source)],
+                       check=True)
+        repo = 'example/single'
+        self.repos[repo] = {'id': 2, 'full_name': repo, 'default_branch': 'main', 'permissions': {'push': True}}
+        self.comments[repo] = []
+        subprocess.run(['git', '-C', str(source), 'remote', 'set-url', 'origin', 'https://github.com/' + repo],
+                       check=True)
+        original_config = (source / '.git/config').read_bytes()
+        def local_fetch(cwd, *args):
+            if args[0] == 'fetch':
+                return self.real_git(cwd, '-c', f'url.{remote}.insteadOf=https://github.com/{repo}', *args)
+            return self.real_git(cwd, *args)
+        with patch.object(b, 'git', side_effect=local_fetch):
+            self.manager.add(repo, source, base='develop')
+            before = subprocess.check_output(['git', '-C', str(source), 'rev-parse',
+                                              'refs/remotes/origin/develop'], text=True).strip()
+            subprocess.run(['git', '-C', str(seed), '-c', 'user.name=Fixture',
+                            '-c', 'user.email=fixture@example.invalid', 'commit', '--allow-empty', '-qm', 'new base'],
+                           check=True)
+            subprocess.run(['git', '-C', str(seed), 'push', '-q', str(remote), 'develop'], check=True)
+            expected = subprocess.check_output(['git', '-C', str(seed), 'rev-parse', 'HEAD'], text=True).strip()
+            self.assertNotEqual(before, expected)
+            self.comment(repo, 101)
+            self.tick()
+        _, state, _ = self.manager.projects[2]
+        self.assertEqual(state.row(1)['state'], 'succeeded', state.row(1)['detail'])
+        self.assertEqual(state.row(1)['head'], expected)
+        self.assertEqual(subprocess.check_output(['git', '-C', str(source), 'branch', '--show-current'],
+                                                 text=True).strip(), 'main')
+        self.assertEqual((source / '.git/config').read_bytes(), original_config)
 
     def test_available_projects_and_missing_prerequisites(self):
         self.add_project('one', 1)

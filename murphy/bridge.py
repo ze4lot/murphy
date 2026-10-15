@@ -22,7 +22,7 @@ import sys
 import time
 import uuid
 
-from .auth import environment
+from .auth import check_git_headers, environment
 
 @dataclass(frozen=True)
 class Config:
@@ -418,6 +418,7 @@ def permission_args(before):
 
 
 def checkout(cwd):
+    check_git_headers(CONFIG, cwd)
     origin = git(cwd, 'remote', 'get-url', 'origin')
     expected = {prefix + CONFIG.repository.casefold() + suffix
                 for prefix in ('git@github.com:', 'https://github.com/', 'ssh://git@github.com/')
@@ -616,6 +617,7 @@ class Worker:
         plan = {'issue': issue, 'reasoning': effort, 'base': base, 'branch': branch,
                 'cwd': str(cwd), 'repo': config['repo'], 'model': config['model']}
         git(config['repo'], 'fetch', 'origin')
+        git(config['repo'], 'fetch', 'origin', f'+refs/heads/{base}:refs/remotes/origin/{base}')
         refs = git(config['repo'], 'for-each-ref', '--format=%(refname)', 'refs/heads', 'refs/remotes/origin').splitlines()
         existing = re.compile(rf'^refs/(?:heads|remotes/origin)/codex/issue-{row["item"]}(?:-|$)')
         if any(existing.match(ref) for ref in refs):

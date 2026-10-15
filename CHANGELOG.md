@@ -8,6 +8,7 @@
 - Repository discovery, explicit project connection, managed clones or existing checkouts and automatic base/ID detection.
 - Multiple repositories share a persistent serial scheduling order and global controls. Tasks/sessions/checkpoints remain isolated per project.
 - Account revalidation, global handling of uncertain outcomes, retained cancellation/draining and report-only retry.
+- Review fixes: reject repository Authorization headers in separate-account mode, retain queued tasks during executor-check failures, and fetch/refresh explicit task bases in single-branch checkouts.
 - Legacy explicit-JSON commands and scoped session state remain supported without implicit migration.
 - Isolated installation/archive/reproducibility checks, behavior coverage and Linux Python 3.11/3.12 CI.
 

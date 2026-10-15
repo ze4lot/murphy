@@ -119,6 +119,22 @@ class AuthenticationTests(unittest.TestCase):
         self.assertTrue(all(not call['token_present'] for call in credential_calls))
         self.assertTrue(all(call['directory'] == self.config.gh_config_dir for call in credential_calls))
 
+    def test_repository_authorization_headers_block_source_and_linked_checkouts(self):
+        linked = self.root / 'linked'
+        subprocess.run(['git', '-C', str(self.cwd), 'worktree', 'add', '-qb', 'codex/linked', str(linked)],
+                       check=True)
+        subprocess.run(['git', '-C', str(self.cwd), 'config',
+                        'http.https://github.com/example/project.git.extraHeader',
+                        'aUtHoRiZaTiOn: Basic fictional-owner-token'], check=True)
+        original = (self.cwd / '.git/config').read_bytes()
+        with project_config(self.config):
+            for cwd in (self.cwd, linked):
+                with self.subTest(cwd=cwd), self.assertRaisesRegex(ValueError, 'repository Authorization headers') as error:
+                    b.checkout(str(cwd))
+                self.assertNotIn('fictional-owner-token', str(error.exception))
+        self.assertEqual((self.cwd / '.git/config').read_bytes(), original)
+        self.assertFalse(self.fallback_marker.exists())
+
     def test_replayed_commit_keeps_original_author_and_executor_committer(self):
         subprocess.run(['git', '-C', str(self.cwd), 'switch', '-qc', 'original-author'], check=True)
         (self.cwd / 'original.txt').write_text('original author work\n')

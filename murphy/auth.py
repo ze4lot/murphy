@@ -45,6 +45,22 @@ def environment(settings):
     return env
 
 
+def check_git_headers(settings, cwd):
+    """Refuse repository Authorization headers that can bypass our helper."""
+    if not settings.gh_config_dir:
+        return
+    result = subprocess.run([settings.git, '-C', cwd, 'config', '--null', '--get-regexp',
+                             r'^http(\..*)?\.extraheader$'],
+                            capture_output=True, text=True, env=environment(settings))
+    if result.returncode not in (0, 1):
+        raise ValueError('Cannot inspect repository HTTP headers for separate-account mode.')
+    for entry in result.stdout.split('\0'):
+        value = entry.partition('\n')[2]
+        if any(line.partition(':')[0].strip().casefold() == 'authorization' for line in value.splitlines()):
+            raise ValueError('Separate-account mode refuses repository Authorization headers. '
+                             'Inspect and remove the local http.*.extraHeader setting before retrying.')
+
+
 def login(settings):
     """Authenticate in the executor's directory, never the user's default gh."""
     env = environment(settings)

@@ -67,6 +67,8 @@ After setup the worker does not need the owner's login or token. Switching/loggi
 
 Git credentials come from the executor's `gh` login through a scoped helper. Human credential helpers and system/global Git settings are not loaded for these separate-account processes; repository settings/hooks remain in place. No global Git config or default `gh` login is edited. Use standard `gh`/`git` executables in this mode; custom wrappers must honor the supplied executor environment. A wrapper that forces another account is incompatible.
 
+Separate-account mode refuses checkouts with repository `http.*.extraHeader` Authorization headers, including URL-specific headers, because these can bypass the executor's credential helper. Inspect and remove those local settings yourself before connecting or retrying the checkout; Murphy does not rewrite them or print their values.
+
 `murphy auth status` shows the saved owner, executor, mode and current executor authentication (exit 1 on missing/changed authentication). To restore an expired/logged-out executor, stop the worker and run:
 
 ```bash
@@ -154,6 +156,8 @@ Trusted local operators can use `murphy enqueue TASK start|continue --project OW
 Defaults: poll every 30 seconds, execution timeout 600 seconds. While idle Murphy calls GitHub, not a model. Change them with `murphy run --poll-seconds 5 --timeout 180`. `murphy run --once` performs one scheduling pass and runs at most one task.
 
 Commands receive installation-wide IDs, shown in reports and `murphy status`. Newly discovered commands are enrolled by comment creation time/ID; already-enrolled commands keep their durable order. A repository temporarily unavailable to polling retains its cursor and joins the queue on recovery. This is discovery order, not a promise of perfect GitHub-wide chronology during outages.
+
+If the periodic executor check fails because authentication or the API is unavailable, queued tasks stay queued. Scheduling resumes after a successful check; the normal poll interval also controls these retries.
 
 Controls work locally or as whole comments in connected repositories, including during another project's active turn:
 

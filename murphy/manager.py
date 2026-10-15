@@ -154,6 +154,7 @@ class Manager:
         self.poll_seconds = 30
         self.timeout = 600
         self.last_identity_check = 0
+        self.account_ready = False
 
     def close(self):
         for _, state, _ in self.projects.values():
@@ -326,7 +327,7 @@ class Manager:
                                    check=True, timeout=300, env=auth.environment(config))
                 b.checkout(str(source))
                 b.git(str(source), 'check-ref-format', '--branch', base)
-                b.git(str(source), 'fetch', 'origin', base)
+                b.git(str(source), 'fetch', 'origin', f'+refs/heads/{base}:refs/remotes/origin/{base}')
                 b.git(str(source), 'rev-parse', '--verify', f'refs/remotes/origin/{base}^{{commit}}')
                 latest = github.latest()
                 state.configure_autostart(source, state.directory / 'worktrees', base, model,
@@ -382,14 +383,18 @@ class Manager:
 
     def pump(self):
         if self.stop:
-            return
+            return False
         if time.monotonic() - self.last_identity_check >= self.poll_seconds:
             self.last_identity_check = time.monotonic()
             try:
                 self.account.verify()
             except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+                self.account_ready = False
                 print(f'Account check deferred; queue retained: {error}', file=sys.stderr)
-                return
+            else:
+                self.account_ready = True
+        if not self.account_ready:
+            return False
         for config, _, worker in self.projects.values():
             with project_config(config):
                 b.Worker.poll(worker)
@@ -405,6 +410,7 @@ class Manager:
                         state.finish(row['id'], 'succeeded', 'Controller operation; no model invoked')
                     except Exception as error:
                         state.finish(row['id'], 'failed', str(error))
+        return True
 
     def reports(self):
         for config, _, worker in self.projects.values():
@@ -412,7 +418,8 @@ class Manager:
                 worker.reports()
 
     def tick(self, fd):
-        self.pump()
+        if not self.pump():
+            return
         self.reports()
         if self.stop or self.setting('paused') == '1' or self.unknown():
             return
