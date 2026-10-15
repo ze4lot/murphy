@@ -31,9 +31,12 @@ Run focused checks while developing. The current local behavior suite is:
 
 ```bash
 python3 tests/test_bridge.py
+python3 tests/test_manager.py
 ```
 
 It uses temporary repositories and a CLI double; it does not need real model calls, GitHub writes or installation credentials. Process tests require Linux.
+
+For packaging changes, also run `python3 tests/check_package.py` in an environment with the `build` frontend installed; see `RELEASE.md`. It builds, inspects and installs both candidate formats with no GitHub or model access.
 
 - Run the relevant checks before reporting completion. For documentation-only edits, review the diff and run `git diff --check`; a full behavior-suite rerun is normally unnecessary.
 - If repository hooks or CI checks are configured, respect them and never bypass hooks with `--no-verify`. Do not repeat successful full checks without a concrete reason.

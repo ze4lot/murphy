@@ -2,7 +2,6 @@
 """Optional native Codex sandbox smoke check; no model calls or GitHub writes."""
 import argparse
 import http.server
-import importlib.util
 from pathlib import Path
 import subprocess
 import sys
@@ -10,10 +9,8 @@ import tempfile
 import threading
 
 ROOT = Path(__file__).resolve().parent.parent
-spec = importlib.util.spec_from_file_location('bridge', ROOT / 'bridge.py')
-bridge = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = bridge
-spec.loader.exec_module(bridge)
+sys.path.insert(0, str(ROOT))
+from murphy import bridge
 
 
 class Handler(http.server.BaseHTTPRequestHandler):

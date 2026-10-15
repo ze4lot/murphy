@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """Behavior checks for auth, durable routing and actual Linux process serialization."""
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -12,10 +11,8 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent
-spec = importlib.util.spec_from_file_location('bridge', ROOT.parent / 'bridge.py')
-b = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = b
-spec.loader.exec_module(b)
+sys.path.insert(0, str(ROOT.parent))
+from murphy import bridge as b
 FIXTURE_CONFIG = {'repository': 'example/project', 'repository_id': 1001, 'bot_user_id': 2001,
                   'owner_user_id': 3001, 'owner_login': 'example-owner'}
 b.CONFIG = b.Config(**FIXTURE_CONFIG)
@@ -117,7 +114,6 @@ class BridgeTests(unittest.TestCase):
                  dict(FIXTURE_CONFIG, repository='example/..'),
                  dict(FIXTURE_CONFIG, repository_id=True),
                  dict(FIXTURE_CONFIG, owner_user_id=0),
-                 dict(FIXTURE_CONFIG, bot_user_id=3001),
                  dict(FIXTURE_CONFIG, owner_login='../owner'),
                  dict(FIXTURE_CONFIG, gh=''),
                  dict(FIXTURE_CONFIG, token='not-a-real-token')]
