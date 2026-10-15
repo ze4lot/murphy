@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """Behavior checks for auth, durable routing and actual Linux process serialization."""
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -12,10 +11,8 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent
-spec = importlib.util.spec_from_file_location('bridge', ROOT.parent / 'bridge.py')
-b = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = b
-spec.loader.exec_module(b)
+sys.path.insert(0, str(ROOT.parent))
+from murphy import bridge as b
 FIXTURE_CONFIG = {'repository': 'example/project', 'repository_id': 1001, 'bot_user_id': 2001,
                   'owner_user_id': 3001, 'owner_login': 'example-owner'}
 b.CONFIG = b.Config(**FIXTURE_CONFIG)
@@ -117,7 +114,6 @@ class BridgeTests(unittest.TestCase):
                  dict(FIXTURE_CONFIG, repository='example/..'),
                  dict(FIXTURE_CONFIG, repository_id=True),
                  dict(FIXTURE_CONFIG, owner_user_id=0),
-                 dict(FIXTURE_CONFIG, bot_user_id=3001),
                  dict(FIXTURE_CONFIG, owner_login='../owner'),
                  dict(FIXTURE_CONFIG, gh=''),
                  dict(FIXTURE_CONFIG, token='not-a-real-token')]
@@ -302,6 +298,121 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(self.state.row(first)['thread_id'], self.state.row(second)['thread_id'])
         self.assertEqual(self.state.setting('paused'), '0')
 
+    def test_turn_result_uses_explicit_outcome_and_rejects_invalid_contracts(self):
+        self.assertEqual(b.turn_result('{"outcome":"waiting_for_user","message":"Specify A or B."}'),
+                         ('waiting_for_user', 'Specify A or B.'))
+        self.assertEqual(b.turn_result('{"outcome":"succeeded","message":"Verified ? handling."}')[0],
+                         'succeeded')
+        for value in ('Which option?', '[]', '{}', '{"outcome":"waiting_for_user","message":" "}',
+                      '{"outcome":"succeeded","message":42}',
+                      '{"outcome":"unexpected","message":"done"}',
+                      '{"outcome":"succeeded","message":"done","extra":true}'):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                b.turn_result(value)
+
+    def test_waiting_turn_keeps_checkpoint_and_frees_the_serial_slot(self):
+        other_cwd = Path(self.temp.name) / 'other-task'
+        b.git(str(self.cwd), 'worktree', 'add', '-qb', 'codex/other-task', str(other_cwd))
+        self.state.register('other', other_cwd, 'codex/other-task')
+        first = self.state.enqueue('a', 'start', 'ASK_OWNER WRITE_TASK_FILE')
+        second = self.state.enqueue('other', 'start', 'SUCCESS_WITH_QUESTION_MARK')
+        self.execute()
+        self.assertEqual(self.state.row(first)['state'], 'waiting_for_user')
+        self.assertEqual(self.state.setting('paused'), '0')
+        self.assertFalse(b.descendants())
+        self.execute()
+        self.assertEqual(self.state.row(second)['state'], 'succeeded')
+        self.assertGreaterEqual(self.state.row(second)['started'], self.state.row(first)['finished'])
+        reply = self.state.enqueue('a', 'continue', 'WRITE_TASK_FILE')
+        self.execute()
+        self.assertEqual(self.state.row(reply)['state'], 'succeeded')
+        self.assertEqual(self.state.row(reply)['thread_id'], self.state.row(first)['thread_id'])
+        self.assertNotEqual(self.state.row(second)['thread_id'], self.state.row(first)['thread_id'])
+        self.assertEqual((self.cwd / 'task.txt').read_text(), 'task change\ntask change\n')
+
+    def test_malformed_turn_result_is_unknown_and_never_guessed_from_question_text(self):
+        first = self.state.enqueue('a', 'start', 'INVALID_TURN_RESULT')
+        second = self.state.enqueue('b', 'start', 'read')
+        self.execute()
+        self.execute()
+        self.assertEqual(self.state.row(first)['state'], 'unknown')
+        self.assertIn('Invalid turn result', self.state.row(first)['detail'])
+        self.assertEqual(self.state.row(second)['state'], 'queued')
+        self.assertEqual(self.state.setting('paused'), '1')
+        self.assertEqual(len(list(self.state.directory.glob('*.jsonl'))), 1)
+
+    def test_waiting_result_does_not_override_timeout_or_undrained_descendants(self):
+        self.worker.timeout = 0.2
+        ident = self.state.enqueue('a', 'start', 'ASK_OWNER DAEMON_FOREVER')
+        self.execute()
+        self.assertEqual(self.state.row(ident)['state'], 'unknown')
+        self.assertEqual(self.state.setting('paused'), '1')
+        self.assertFalse(b.descendants())
+
+    def test_waiting_report_contains_question_and_reply_instructions(self):
+        ident = self.state.enqueue('a', 'start', 'read', item=226)
+        self.state.finish(ident, 'waiting_for_user', 'Specify A or B.')
+        with patch.object(b.GitHub, 'api', side_effect=[[], {'id': 1001}]) as call:
+            self.assertEqual(b.GitHub().report(self.state.row(ident)), 1001)
+        body = call.call_args.args[2]['body']
+        self.assertIn('Specify A or B.', body)
+        self.assertIn('`/murphy continue`', body)
+        for metadata in ('[Murphy]', 'Thread:', 'Turn:', 'Execution:', 'HEAD:', 'Reasoning:', '— Murphy'):
+            self.assertNotIn(metadata, body)
+
+    def test_report_preserves_full_repo_details_without_agent_labels_or_debug_metadata(self):
+        ident = self.state.enqueue('a', 'start', 'read', item=226)
+        content = ('Implemented: complete fixture change.\n\n' + 'Checked existing behavior.\n' * 120
+                   + '\nPR: https://github.com/example/project/pull/12\nCommit: abcdef123\nQA: pre-commit PASS')
+        report = '[Codex][DONE]\n\n' + content + '\n\n— Codex / Murphy (example-executor)'
+        self.state.finish(ident, 'succeeded', report)
+        with patch.object(b.GitHub, 'api', side_effect=[[], {'id': 1001}]) as call:
+            b.GitHub().report(self.state.row(ident))
+        body = call.call_args.args[2]['body']
+        self.assertIn(content, body)  # Preserve QA/PR details beyond the old 2200-character limit.
+        self.assertTrue(body.startswith('<!-- codex-bridge:' + self.state.row(ident)['execution_id'] + ' -->'))
+        for metadata in ('[Codex]', '[Murphy]', 'Thread:', 'Turn:', 'Execution:', 'HEAD:', 'Reasoning:',
+                         '— Codex', 'example-executor'):
+            self.assertNotIn(metadata, body)
+        self.assertEqual(self.state.row(ident)['detail'], report)
+
+    def test_report_cleanup_preserves_agent_names_and_labels_inside_actual_content(self):
+        ident = self.state.enqueue('a', 'start', 'read', item=226)
+        content = 'Implemented a Murphy setting.\n\n```text\n[Codex][DONE]\n— Murphy\n```'
+        self.state.finish(ident, 'succeeded', '[Codex][DONE]\n\n' + content)
+        with patch.object(b.GitHub, 'api', side_effect=[[], {'id': 1001}]) as call:
+            b.GitHub().report(self.state.row(ident))
+        self.assertIn(content, call.call_args.args[2]['body'])
+
+    def test_oversized_report_is_bounded_and_full_text_remains_in_status(self):
+        ident = self.state.enqueue('a', 'start', 'read', item=226)
+        report = 'Detailed findings.\n' * 1000
+        self.state.finish(ident, 'succeeded', report)
+        with patch.object(b.GitHub, 'api', side_effect=[[], {'id': 1001}]) as call:
+            b.GitHub().report(self.state.row(ident))
+        body = call.call_args.args[2]['body']
+        self.assertLess(len(body), 13000)
+        self.assertIn('Report shortened', body)
+        self.assertEqual(self.state.row(ident)['detail'], report)
+
+    def test_dirty_summary_lists_staged_renamed_untracked_and_ignores_contents(self):
+        tracked = self.cwd / 'old name.txt'
+        tracked.write_text('private original contents\n')
+        b.git(str(self.cwd), 'add', tracked.name)
+        b.git(str(self.cwd), '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+              'commit', '-qm', 'tracked fixture')
+        b.git(str(self.cwd), 'mv', tracked.name, 'new name.txt')
+        (self.cwd / 'new name.txt').write_text('private replacement contents\n')
+        (self.cwd / 'untracked\nfile.txt').write_text('private untracked contents\n')
+        (self.cwd / '.git/info/exclude').write_text('ignored.txt\n')
+        (self.cwd / 'ignored.txt').write_text('private ignored contents\n')
+        summary = b.dirty_summary(str(self.cwd))
+        self.assertIn('Changed: "new name.txt"', summary)
+        self.assertIn('Previous path: "old name.txt"', summary)
+        self.assertIn('Untracked: "untracked\\nfile.txt"', summary)
+        self.assertNotIn('ignored.txt', summary)
+        self.assertNotIn('contents', summary)
+
     def test_agent_commit_is_accepted_and_report_uses_new_head(self):
         before = b.checkout(str(self.cwd))['head']
         ident = self.state.enqueue('a', 'start', 'COMMIT_TASK_FILE')
@@ -385,6 +496,10 @@ class BridgeTests(unittest.TestCase):
             self.assertIn(str(self.cwd / '.git'), profile)
             self.assertIn('commit, push the task branch', event['prompt'])
             self.assertIn('Configured GitHub CLI executable:', event['prompt'])
+            self.assertIn('--output-schema', args)
+            schema = json.loads(Path(args[args.index('--output-schema') + 1]).read_text())
+            self.assertEqual(schema, b.TURN_SCHEMA)
+            self.assertIn('waiting_for_user', event['prompt'])
 
     def test_timeout_kills_detached_child_before_slot_is_released(self):
         self.worker.timeout = 0.3
@@ -586,6 +701,50 @@ class BridgeTests(unittest.TestCase):
             else:
                 self.assertNotIn('Changed after the start.', event['prompt'])
         self.assertEqual(self.state.ingest(list(self.api.data.values())), [])
+
+    def test_dirty_source_blocks_before_fetch_and_requires_explicit_resume(self):
+        fetch = self.setup_autostart()
+        dirty = self.cwd / 'private draft.txt'
+        dirty.write_text('secret draft contents\n')
+        self.api.data = {101: comment(101, item=500)}
+        ident = self.state.ingest(list(self.api.data.values()))[0]
+        with fetch as calls:
+            self.execute()
+            self.assertFalse(any(call.args[1] in ('fetch', 'worktree') for call in calls.call_args_list))
+            blocked = self.state.row(ident)
+            self.assertEqual(blocked['state'], 'blocked')
+            self.assertIsNone(blocked['started'])
+            self.assertIsNone(blocked['finished'])
+            self.assertIsNone(blocked['plan'])
+            self.assertEqual(self.state.setting('paused'), '1')
+            self.assertFalse((Path(self.temp.name) / 'automatic').exists())
+            self.assertFalse(list(self.state.directory.glob('*.jsonl')))
+            self.assertEqual(dirty.read_text(), 'secret draft contents\n')
+            self.assertEqual(len(self.api.report_calls), 1)
+            self.assertIn('private draft.txt', self.api.report_calls[0]['detail'])
+            self.assertNotIn('secret draft contents', self.api.report_calls[0]['detail'])
+            self.state.control('resume')
+            self.execute()  # Resuming without cleanup blocks again, before any execution.
+            self.assertEqual(self.state.row(ident)['state'], 'blocked')
+            dirty.unlink()  # Simulate the owner's cleanup, outside the worker.
+            self.execute()
+            self.assertEqual(self.state.row(ident)['state'], 'blocked')
+            self.state.control('resume')
+            self.execute()
+        self.assertEqual(self.state.row(ident)['state'], 'succeeded')
+        self.assertEqual(self.state.row(ident)['execution_id'], blocked['execution_id'])
+        self.assertEqual(len(list(self.state.directory.glob('*.jsonl'))), 1)
+
+    def test_blocked_notice_reconciles_existing_comment_after_uncertain_post(self):
+        ident = self.state.enqueue('a', 'start', 'read', item=226)
+        self.state.block(ident, 'Source has uncommitted files: draft.txt')
+        row = self.state.row(ident)
+        existing = {'id': 1001, 'user': {'id': b.CONFIG.bot_user_id},
+                    'body': '<!-- codex-bridge:' + row['execution_id'] + ' -->'}
+        with patch.object(b.GitHub, 'api', side_effect=[[existing], {'id': 1001}]) as call:
+            self.assertEqual(b.GitHub().report(row), 1001)
+        self.assertEqual(call.call_args_list[1].args[1], 'PATCH')
+        self.assertIn('Source has uncommitted files: draft.txt', call.call_args_list[1].args[2]['body'])
 
     def test_autostart_without_reasoning_pins_high_for_start_and_continue(self):
         fetch = self.setup_autostart(body='Read HEAD only.')

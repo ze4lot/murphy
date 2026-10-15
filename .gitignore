@@ -14,3 +14,8 @@ worktrees/
 *.sqlite3-*
 *.jsonl
 *.stderr
+build/
+dist/
+*.egg-info/
+/auth/
+/checkouts/

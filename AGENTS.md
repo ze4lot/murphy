@@ -21,6 +21,7 @@ This is a short working guide for any coding agent contributing to Murphy. Keep 
 
 - Normally use a task-specific branch from `develop` and target PRs at `develop`. Follow an explicitly established parent feature branch or another requested base when applicable.
 - `master` is the release branch. Direct pushes to shared branches require an explicit request; do not merge, close issues, publish releases or deploy without authorization.
+- GitHub CI runs only after a same-repository PR from `develop` is merged into `master`. Task PRs and pushes use local verification; do not add other CI triggers or manually dispatch CI without an explicit request.
 - Read existing issue/PR feedback before continuing work. Update the existing task branch/PR when appropriate instead of creating a replacement.
 - Use the locally configured Git/GitHub identity intended for the work. Never impersonate a human, silently change accounts or alter global Git/authentication settings.
 - Make commits and PRs easy to review: describe the concrete change, relevant verification and remaining limitations. Identify agent-authored issue reports clearly and preserve earlier reports.
@@ -31,9 +32,13 @@ Run focused checks while developing. The current local behavior suite is:
 
 ```bash
 python3 tests/test_bridge.py
+python3 tests/test_manager.py
+python3 tests/test_auth.py
 ```
 
 It uses temporary repositories and a CLI double; it does not need real model calls, GitHub writes or installation credentials. Process tests require Linux.
+
+For packaging changes, also run `python3 tests/check_package.py` in an environment with the `build` frontend installed; see `RELEASE.md`. It builds, inspects and installs both candidate formats with no GitHub or model access.
 
 - Run the relevant checks before reporting completion. For documentation-only edits, review the diff and run `git diff --check`; a full behavior-suite rerun is normally unnecessary.
 - If repository hooks or CI checks are configured, respect them and never bypass hooks with `--no-verify`. Do not repeat successful full checks without a concrete reason.
