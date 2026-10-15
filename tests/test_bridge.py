@@ -298,6 +298,24 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(self.state.row(first)['thread_id'], self.state.row(second)['thread_id'])
         self.assertEqual(self.state.setting('paused'), '0')
 
+    def test_dirty_summary_lists_staged_renamed_untracked_and_ignores_contents(self):
+        tracked = self.cwd / 'old name.txt'
+        tracked.write_text('private original contents\n')
+        b.git(str(self.cwd), 'add', tracked.name)
+        b.git(str(self.cwd), '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+              'commit', '-qm', 'tracked fixture')
+        b.git(str(self.cwd), 'mv', tracked.name, 'new name.txt')
+        (self.cwd / 'new name.txt').write_text('private replacement contents\n')
+        (self.cwd / 'untracked\nfile.txt').write_text('private untracked contents\n')
+        (self.cwd / '.git/info/exclude').write_text('ignored.txt\n')
+        (self.cwd / 'ignored.txt').write_text('private ignored contents\n')
+        summary = b.dirty_summary(str(self.cwd))
+        self.assertIn('Changed: "new name.txt"', summary)
+        self.assertIn('Previous path: "old name.txt"', summary)
+        self.assertIn('Untracked: "untracked\\nfile.txt"', summary)
+        self.assertNotIn('ignored.txt', summary)
+        self.assertNotIn('contents', summary)
+
     def test_agent_commit_is_accepted_and_report_uses_new_head(self):
         before = b.checkout(str(self.cwd))['head']
         ident = self.state.enqueue('a', 'start', 'COMMIT_TASK_FILE')
@@ -582,6 +600,50 @@ class BridgeTests(unittest.TestCase):
             else:
                 self.assertNotIn('Changed after the start.', event['prompt'])
         self.assertEqual(self.state.ingest(list(self.api.data.values())), [])
+
+    def test_dirty_source_blocks_before_fetch_and_requires_explicit_resume(self):
+        fetch = self.setup_autostart()
+        dirty = self.cwd / 'private draft.txt'
+        dirty.write_text('secret draft contents\n')
+        self.api.data = {101: comment(101, item=500)}
+        ident = self.state.ingest(list(self.api.data.values()))[0]
+        with fetch as calls:
+            self.execute()
+            self.assertFalse(any(call.args[1] in ('fetch', 'worktree') for call in calls.call_args_list))
+            blocked = self.state.row(ident)
+            self.assertEqual(blocked['state'], 'blocked')
+            self.assertIsNone(blocked['started'])
+            self.assertIsNone(blocked['finished'])
+            self.assertIsNone(blocked['plan'])
+            self.assertEqual(self.state.setting('paused'), '1')
+            self.assertFalse((Path(self.temp.name) / 'automatic').exists())
+            self.assertFalse(list(self.state.directory.glob('*.jsonl')))
+            self.assertEqual(dirty.read_text(), 'secret draft contents\n')
+            self.assertEqual(len(self.api.report_calls), 1)
+            self.assertIn('private draft.txt', self.api.report_calls[0]['detail'])
+            self.assertNotIn('secret draft contents', self.api.report_calls[0]['detail'])
+            self.state.control('resume')
+            self.execute()  # Resuming without cleanup blocks again, before any execution.
+            self.assertEqual(self.state.row(ident)['state'], 'blocked')
+            dirty.unlink()  # Simulate the owner's cleanup, outside the worker.
+            self.execute()
+            self.assertEqual(self.state.row(ident)['state'], 'blocked')
+            self.state.control('resume')
+            self.execute()
+        self.assertEqual(self.state.row(ident)['state'], 'succeeded')
+        self.assertEqual(self.state.row(ident)['execution_id'], blocked['execution_id'])
+        self.assertEqual(len(list(self.state.directory.glob('*.jsonl'))), 1)
+
+    def test_blocked_notice_reconciles_existing_comment_after_uncertain_post(self):
+        ident = self.state.enqueue('a', 'start', 'read', item=226)
+        self.state.block(ident, 'Source has uncommitted files: draft.txt')
+        row = self.state.row(ident)
+        existing = {'id': 1001, 'user': {'id': b.CONFIG.bot_user_id},
+                    'body': '<!-- codex-bridge:' + row['execution_id'] + ' -->'}
+        with patch.object(b.GitHub, 'api', side_effect=[[existing], {'id': 1001}]) as call:
+            self.assertEqual(b.GitHub().report(row), 1001)
+        self.assertEqual(call.call_args_list[1].args[1], 'PATCH')
+        self.assertIn('**blocked**', call.call_args_list[1].args[2]['body'])
 
     def test_autostart_without_reasoning_pins_high_for_start_and_continue(self):
         fetch = self.setup_autostart(body='Read HEAD only.')

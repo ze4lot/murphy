@@ -375,6 +375,8 @@ class Manager:
         elif verb == 'resume':
             if self.unknown():
                 raise ValueError('Resolve unknown outcomes in every project before resuming.')
+            for _, state, _ in self.projects.values():
+                b.State.control(state, 'resume')
             self.set_paused(False)
         elif verb == 'cancel':
             _, state, _, row = self.command(int(target))

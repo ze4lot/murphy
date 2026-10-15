@@ -159,12 +159,16 @@ Commands receive installation-wide IDs, shown in reports and `murphy status`. Ne
 
 If the periodic executor check fails because authentication or the API is unavailable, queued tasks stay queued. Scheduling resumes after a successful check; the normal poll interval also controls these retries.
 
+Before a task starts or continues, Murphy checks the connected source checkout for staged, unstaged and untracked files (ignored files do not block it). Uncommitted changes mark the command `blocked` and pause the shared queue before any fetch, new task worktree or model call. The triggering issue receives a report with relative file names, never file contents; long lists are shortened with a notice. Publication retries reconcile the same comment and do not repeatedly notify while paused. The pause and command survive restarts.
+
+Clean up the source checkout yourself, then run `murphy resume` or post `/murphy resume` as the owner in a connected project. Cleanup alone does not restart work. Resuming retries the same command after author/source revalidation and another checkout check; a still-dirty source blocks again. `murphy cancel ID` also accepts blocked commands. Murphy never commits, stashes, resets or deletes the owner's changes to clear this guard. An assigned task's own saved uncommitted checkpoint remains valid for continuation, including when an explicitly registered task uses the source checkout itself. Other changes to its task worktree retain the existing `unknown`/reconciliation protection.
+
 Controls work locally or as whole comments in connected repositories, including during another project's active turn:
 
 | Local command | GitHub comment | Effect |
 | --- | --- | --- |
 | `murphy pause` | `/murphy pause` | Let the current turn finish; hold all projects. |
-| `murphy resume` | `/murphy resume` | Resume after all unknown outcomes are resolved. |
+| `murphy resume` | `/murphy resume` | Retry blocked commands after cleanup; resume after all unknown outcomes are resolved. |
 | `murphy cancel 12` | `/murphy cancel 12` | Cancel the global command ID, even in another project. |
 | `murphy status` | — | Inspect projects, commands and pause state. |
 

@@ -333,6 +333,71 @@ class ManagerTests(unittest.TestCase):
         self.tick()
         self.assertEqual(second.row(1)['state'], 'succeeded')
 
+    def test_dirty_source_pauses_reports_once_survives_restart_and_resumes_from_github(self):
+        _, first, worker = self.add_project('one', 1)
+        _, second, _ = self.add_project('two', 2)
+        dirty = self.root / 'one/draft.txt'
+        dirty.write_text('private owner contents\n')
+        self.comment('example/one', 101)
+        self.comment('example/two', 102)
+        self.tick()
+        blocked = first.row(1)
+        self.assertEqual(blocked['state'], 'blocked')
+        self.assertEqual(second.row(1)['state'], 'queued')
+        self.assertEqual(self.manager.setting('paused'), '1')
+        self.assertFalse(list(first.directory.glob('*.jsonl')))
+        with patch.object(worker.github, 'report', side_effect=RuntimeError('network outage')):
+            self.manager.reports()
+        worker.report_retry_after = 0
+        self.manager.reports()
+        self.manager.reports()
+        self.assertEqual(len(self.reported), 1)
+        self.assertEqual(self.reported[0][0], 'example/one')
+        self.assertIn('Command 1: **blocked**', self.reported[0][1]['body'])
+        self.assertIn('draft.txt', self.reported[0][1]['body'])
+        self.assertNotIn('private owner contents', self.reported[0][1]['body'])
+        other = Manager(self.manager.directory)
+        try:
+            self.assertEqual(other.run(once=True), 0)
+        finally:
+            other.close()
+        self.assertEqual(first.row(1)['state'], 'blocked')
+        self.assertEqual(len(self.reported), 1)
+        dirty.unlink()  # The owner cleans up; the worker itself must not do so.
+        self.tick()
+        self.assertEqual(first.row(1)['state'], 'blocked')
+        self.comment('example/two', 103)['body'] = '/murphy resume'
+        self.tick()
+        self.assertEqual(first.row(1)['state'], 'succeeded')
+        self.assertEqual(first.row(1)['execution_id'], blocked['execution_id'])
+        self.assertEqual(second.row(1)['state'], 'queued')
+        self.assertEqual(self.manager.setting('paused'), '0')
+        self.assertEqual(len(list(first.directory.glob('*.jsonl'))), 1)
+
+    def test_blocked_command_can_be_cancelled_without_model_work(self):
+        _, state, _ = self.add_project('one', 1)
+        (self.root / 'one/draft.txt').write_text('private draft\n')
+        self.comment('example/one', 101)
+        self.tick()
+        self.manager.reports()
+        self.assertIsNotNone(state.row(1)['report_id'])
+        self.manager.control('cancel', '1')
+        self.assertEqual(state.row(1)['state'], 'cancelled')
+        self.assertIsNone(state.row(1)['report_id'])
+        self.assertFalse(list(state.directory.glob('*.jsonl')))
+
+    def test_registered_source_allows_its_own_saved_uncommitted_changes(self):
+        _, state, _ = self.add_project('one', 1)
+        self.manager.register('example/one', 'manual', self.root / 'one', 'main', [7])
+        self.manager.enqueue('example/one', 'manual', 'start', 'WRITE_TASK_FILE')
+        self.tick()
+        self.manager.enqueue('example/one', 'manual', 'continue', 'WRITE_TASK_FILE')
+        self.tick()
+        self.assertEqual(state.row(1)['state'], 'succeeded')
+        self.assertEqual(state.row(2)['state'], 'succeeded')
+        self.assertEqual(state.row(1)['thread_id'], state.row(2)['thread_id'])
+        self.assertEqual((self.root / 'one/task.txt').read_text(), 'task change\ntask change\n')
+
     def test_restart_recovers_running_project_and_preserves_order(self):
         _, first, _ = self.add_project('one', 1)
         _, second, _ = self.add_project('two', 2)

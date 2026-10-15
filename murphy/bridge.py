@@ -356,17 +356,27 @@ class State:
             if state == 'unknown':
                 self.set('paused', '1')
 
+    def block(self, ident, detail):
+        # Persist the pause first: a crash must never let later work overtake it.
+        self.control('pause')
+        with self.db:
+            self.db.execute("UPDATE commands SET state='blocked',detail=?,report_id=NULL WHERE id=?",
+                            (detail, ident))
+
     def control(self, verb, target=''):
         with self.db:
             if verb in ('pause', 'resume'):
                 if verb == 'resume' and self.db.execute("SELECT 1 FROM commands WHERE state='unknown'").fetchone():
                     raise ValueError('Resolve unknown outcomes before resuming')
+                if verb == 'resume':
+                    self.db.execute("UPDATE commands SET state='queued',detail='',report_id=NULL WHERE state='blocked'")
                 self.set('paused', '1' if verb == 'pause' else '0')
             elif verb == 'cancel':
                 row = self.row(int(target))
-                if not row or row['state'] not in ('queued', 'running'):
-                    raise ValueError('Only queued/running commands can be cancelled')
-                if row['state'] == 'queued':
+                if not row or row['state'] not in ('queued', 'blocked', 'running'):
+                    raise ValueError('Only queued/blocked/running commands can be cancelled')
+                if row['state'] in ('queued', 'blocked'):
+                    self.db.execute('UPDATE commands SET report_id=NULL WHERE id=?', (row['id'],))
                     self.finish(row['id'], 'cancelled', 'Cancelled before execution')
                 else:
                     self.db.execute('UPDATE commands SET cancel=1 WHERE id=?', (row['id'],))
@@ -379,6 +389,23 @@ def codex_home():
 def git(cwd, *args):
     return subprocess.check_output([CONFIG.git, '-C', cwd, *args], text=True, stderr=subprocess.PIPE,
                                    env=environment(CONFIG)).strip()
+
+
+def dirty_summary(cwd):
+    """Read names/status only; NUL records preserve spaces, renames and newlines."""
+    output = subprocess.check_output([CONFIG.git, '-C', cwd, 'status', '--porcelain=v1', '-z',
+                                      '--untracked-files=all'], stderr=subprocess.PIPE, env=environment(CONFIG))
+    entries = iter(output.split(b'\0'))
+    lines = []
+    for entry in entries:
+        if not entry:
+            continue
+        status, path = entry[:2], os.fsdecode(entry[3:])
+        label = 'Untracked' if status == b'??' else 'Changed'
+        lines.append(f'    {label}: {json.dumps(path)}')
+        if b'R' in status or b'C' in status:
+            lines.append('    Previous path: ' + json.dumps(os.fsdecode(next(entries))))
+    return '\n'.join(lines)
 
 
 def worktree_changes(cwd):
@@ -564,7 +591,7 @@ class Worker:
     def reports(self):
         if not self.github or time.monotonic() < self.report_retry_after:
             return
-        rows = self.state.db.execute("SELECT * FROM commands WHERE state IN ('succeeded','failed','cancelled','unknown') AND item IS NOT NULL AND report_id IS NULL ORDER BY id").fetchall()
+        rows = self.state.db.execute("SELECT * FROM commands WHERE state IN ('blocked','succeeded','failed','cancelled','unknown') AND item IS NOT NULL AND report_id IS NULL ORDER BY id").fetchall()
         for row in rows:
             try:
                 report_id = self.github.report(row)
@@ -633,12 +660,39 @@ class Worker:
         with self.state.db:
             self.state.db.execute('UPDATE commands SET task=? WHERE id=?', (name, row['id']))
 
+    def block_dirty_source(self, row):
+        config = json.loads(self.state.setting('autostart') or 'null')
+        if not config:
+            return False
+        source = config['repo']
+        summary = dirty_summary(source)
+        if not summary:
+            return False
+        task = self.state.db.execute('SELECT * FROM tasks WHERE name=?', (row['task'],)).fetchone()
+        if (task and task['cwd'] == source and task['checkout_json']
+                and checkout(source) == json.loads(task['checkout_json'])):
+            return False  # A registered source can also be this task's own checkpoint.
+        detail = ('Source checkout contains uncommitted changes. No model or task worktree was started.\n\n'
+                  'Commit, stash or remove these changes yourself, then run `murphy resume` '
+                  'or post `/murphy resume`. The shared queue stays paused until you resume it.\n\n' + summary)
+        if len(detail) > 2200:
+            detail = detail[:2100] + '\n\nList shortened; use git status in the source checkout for all paths.'
+        self.state.block(row['id'], detail)
+        print(detail, file=sys.stderr)
+        return True
+
     def execute(self, row, fd):
         try:
             self.verify_comment(row)
         except Exception as error:
             # Deletion, edit, or unavailable API: no model, no guessed authorization.
             self.state.finish(row['id'], 'cancelled', 'Source could not be revalidated: ' + str(error))
+            return
+        try:
+            if self.block_dirty_source(row):
+                return
+        except Exception as error:
+            self.state.finish(row['id'], 'failed', 'Source checkout check failed: ' + str(error))
             return
         if row['task'] is None:
             try:
@@ -659,7 +713,8 @@ class Worker:
             expected = json.loads(task['checkout_json']) if task['checkout_json'] else None
             if (before['branch'] != task['branch'] or before['common_dir'] != task['common_dir']
                     or (expected is not None and before != expected) or (expected is None and before['dirty'])):
-                raise ValueError('Checkout differs from the saved task checkpoint; external changes preserved, no switch/stash/reset allowed')
+                raise ValueError('Checkout differs from the saved task checkpoint; external changes preserved, '
+                                 'no switch/stash/reset allowed\n\n' + dirty_summary(task['cwd']))
         except Exception as error:
             self.state.finish(row['id'], 'unknown', str(error))
             return
