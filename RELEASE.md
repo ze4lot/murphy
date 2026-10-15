@@ -31,7 +31,8 @@ Both must contain the MIT license and fictional example configuration. Inspect t
 1. Open a Draft PR from the task branch to `develop`. Include candidate version, verification results, artifact hashes/build commands, changed usage and known limitations. Keep issue #2 open until authorized closure.
 2. After review and explicit merge authorization, merge the implementation into `develop`.
 3. If requested, perform the documented controlled pilot with the intended external tools/accounts. Record exact versions and measured outcomes; ordinary tests are not a live pilot.
-4. With separate release authorization, prepare a promotion PR from `develop` to `master`, verify the exact candidate commit and review the changelog/artifacts.
-5. Merge the promotion, create a tag, publish a GitHub release or publish to a package index only when explicitly authorized. Recheck that the chosen distribution name is available before any package-index publication; no name reservation is claimed here.
+4. With separate release authorization, prepare a promotion PR from `develop` to `master`, verify the exact candidate commit locally and review the changelog/artifacts. Task PRs and promotion PR updates do not run GitHub CI.
+5. Once authorized, merge the promotion. This is the only event that runs GitHub CI: a merged same-repository `develop` → `master` PR. CI checks out the exact merge commit and runs the Python 3.11/3.12 test/build/install matrix. Closed-but-unmerged PRs and other source branches skip the job; ordinary pushes and manual dispatch do not trigger it.
+6. After that CI passes, create a tag, publish a GitHub release or publish to a package index only when explicitly authorized. Recheck that the chosen distribution name is available before any package-index publication; no name reservation is claimed here.
 
 No shared branch push, merge, tag or publication is part of preparing this candidate.

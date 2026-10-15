@@ -176,7 +176,7 @@ python3 -m venv .venv
 .venv/bin/python tests/check_package.py
 ```
 
-Behavior tests use temporary Git repositories and a Codex CLI double. They do not call real models, publish to GitHub or require private configuration. The package check builds both distribution formats twice, compares hashes, inspects archive contents and installs each in a fresh environment with an empty HOME. Build tools may be downloaded from the Python package index; GitHub/Codex credentials are unnecessary. See [RELEASE.md](RELEASE.md) for exact build/verification commands and promotion steps.
+Behavior tests use temporary Git repositories and a Codex CLI double. They do not call real models, publish to GitHub or require private configuration. The package check builds both distribution formats twice, compares hashes, inspects archive contents and installs each in a fresh environment with an empty HOME. Build tools may be downloaded from the Python package index; GitHub/Codex credentials are unnecessary. GitHub CI runs only after a PR from this repository's `develop` branch is merged into `master`, testing that merge's exact commit. Task PRs and ordinary pushes do not run CI; there is no manual trigger. See [RELEASE.md](RELEASE.md) for exact build/verification commands and promotion steps.
 
 Optional native sandbox check (no model call or GitHub write):
 

@@ -2,20 +2,26 @@ name: Tests and package
 
 on:
   pull_request:
-    branches: [develop, master]
-  workflow_dispatch:
+    types: [closed]
+    branches: [master]
 
 permissions:
   contents: read
 
 jobs:
   check:
+    if: >-
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.head.ref == 'develop' &&
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
     strategy:
       matrix:
         python: ['3.11', '3.12']
     steps:
       - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
       - uses: actions/setup-python@v7.0.0
         with:
           python-version: ${{ matrix.python }}
