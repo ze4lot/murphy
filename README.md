@@ -1,5 +1,9 @@
 # Murphy
 
+<p align="center">
+  <img src="assets/murphy_with_screen.png" alt="Murphy, a robotic goat with a holographic screen" width="420">
+</p>
+
 Murphy lets you work on your GitHub projects by commenting on issues. Install it on Linux/WSL, sign in to GitHub and Codex, connect your repositories and run one local worker. It accepts commands **only from your connected owner account**. By default that account also does the work; optionally sign in a separate executor account for reports, commits, pushes and PRs.
 
 Multiple projects share one durable queue. Murphy runs **one task at a time across all connected repositories**, gives each issue its own branch/worktree and keeps its Codex session for later continuations. It can edit, test, commit, push a task branch and create/update PRs when your instructions call for them. Merge, deployment and releases require separate authorization.
