@@ -6,7 +6,7 @@
 
 Murphy lets you work on your GitHub projects by commenting on issues. Install it on Linux/WSL, sign in to GitHub and Codex, connect your repositories and run one local worker. It accepts commands **only from your connected owner account**. By default that account also does the work; optionally sign in a separate executor account for reports, commits, pushes and PRs.
 
-Multiple projects share one durable queue. Murphy runs **one task at a time across all connected repositories**, gives each issue its own branch/worktree and keeps its Codex session for later continuations. It can edit, test, commit, push a task branch and create/update PRs when your instructions call for them. Merge, deployment and releases require separate authorization.
+Multiple projects share one durable queue. Murphy runs **one task at a time per repository**, with up to **two projects executing concurrently** by default, gives each issue its own branch/worktree and keeps its Codex session for later continuations. It can edit, test, commit, push a task branch and create/update PRs when your instructions call for them. Merge, deployment and releases require separate authorization.
 
 Version `0.1.0` is experimental. Keep backups and start with a disposable project. Nothing is installed as a service.
 
@@ -100,7 +100,7 @@ murphy projects add example/tools --interval 30
 murphy projects list
 ```
 
-`projects list` and `status` show each project's saved `interval`. Existing connected projects receive the 60-second default on upgrade without resetting activation cursors, commands or sessions. Different intervals affect when comments are discovered, not parallelism: all projects still share one serial execution queue.
+`projects list` and `status` show each project's saved `interval`. Existing connected projects receive the 60-second default on upgrade without resetting activation cursors, commands or sessions. Different intervals affect when comments are discovered. Projects share one durable queue, with serial execution within each repository and a bounded number of projects running concurrently.
 
 The source checkout is not switched, cleaned, reset or copied. Task worktrees live outside it. A managed clone failure preserves partial files; inspect them and explicitly use `--checkout` after fixing the problem. Connecting a repository twice fails without moving its activation boundary. An empty repository needs an initial commit before connection. A non-default task base must already exist on the remote.
 
@@ -112,7 +112,7 @@ murphy init --gh /opt/example/bin/gh-wrapper --git /opt/example/bin/git-wrapper 
 
 These must be executable names or paths, not shell command strings. Settings remain private installation state. The ordinary setup requires no JSON editing. Optional per-project `--base` and `--model` settings are supplied to `projects add`; otherwise GitHub's default branch and Codex's default model are used. There is no project removal/reconfiguration command in this candidate; inspect saved work before creating a separate installation.
 
-The executor account is revalidated during polling, before source validation and before GitHub reads/writes. In single-account mode this is your ordinary `gh` account; in separate-account mode it is the private executor login. A changed executor stops the worker; active descendants are drained and an uncertain turn requires reconciliation. Restore the original executor before resuming. For another identity pair, initialize a separate `--state-dir`; existing tasks are never silently rebound to it. The global execution lock still prevents overlapping Murphy workers.
+The executor account is revalidated during polling, before source validation and before GitHub reads/writes. In single-account mode this is your ordinary `gh` account; in separate-account mode it is the private executor login. A changed executor stops the worker; active descendants are drained and an uncertain turn requires reconciliation. Restore the original executor before resuming. For another identity pair, initialize a separate `--state-dir`; existing tasks are never silently rebound to it. The global coordinator lock still prevents overlapping Murphy installations/workers; it does not serialize project executors inside the same coordinator.
 
 ## Give Murphy a task
 
@@ -143,7 +143,7 @@ A new issue gets `codex/issue-<number>-murphy`, its own worktree and a persisten
 
 A continuation resumes the saved UUID and accepts unchanged uncommitted work left by the previous turn. Murphy saves branch/Git directories, HEAD and a fingerprint of index/tracked/untracked changes after each execution. Changes made between turns outside Murphy pause the queue without overwriting them. This detects between-turn changes, not the author of simultaneous human edits. Repeated start fails without replacing a session; continuation without a session fails without inventing one.
 
-When the executor needs an owner decision, it ends its turn with `waiting_for_user` and a concrete question. The saved session, branch/worktree and uncommitted checkpoint stay available; the shared queue moves to other commands with only one active execution at a time. Reply in that issue with `/murphy continue` on the first line and your answer below it. An ordinary comment does not resume work. The continuation joins the existing queue and does not interrupt an active turn. Restarting the worker or running `murphy resume` does not answer the question or replay the waiting turn.
+When the executor needs an owner decision, it ends its turn with `waiting_for_user` and a concrete question. The saved session, branch/worktree and uncommitted checkpoint stay available; its execution slot is released for another queued command. Other projects can keep running, and each project still has only one active execution. Reply in that issue with `/murphy continue` on the first line and your answer below it. An ordinary comment does not resume work. The continuation joins the existing queue and does not interrupt an active turn. Restarting the worker or running `murphy resume` does not answer the question or replay the waiting turn.
 
 Both new and resumed Codex turns use `--output-schema` with explicit `outcome` (`succeeded` or `waiting_for_user`) and human-readable `message`. Murphy validates the final JSON rather than inferring intent from punctuation. `succeeded` means the requested turn completed, not that the issue was closed or its PR merged. Missing/malformed results become `unknown` and hold the queue for reconciliation. Existing saved sessions use the same result contract on their next continuation.
 
@@ -175,7 +175,18 @@ Trusted local operators can use `murphy enqueue TASK start|continue --project OW
 
 Defaults: use each project's saved interval (60 seconds unless specified at connection), execution timeout 600 seconds. While idle Murphy calls GitHub, not a model. Every project is first polled on worker startup, then independently at its interval, including while another project executes. Controls posted on GitHub are discovered at the interval of the repository where they were posted; local controls do not wait for a GitHub poll.
 
-The existing `murphy run --poll-seconds 5 --timeout 180` explicitly overrides **all** project intervals for that run. Omitting `--poll-seconds` uses the saved intervals; the override does not change them, and `projects list`/`status` still display the saved values. Remove this flag from old launch commands to use per-project intervals. `murphy run --once` performs one scheduling pass and runs at most one task.
+The existing `murphy run --poll-seconds 5 --timeout 180` explicitly overrides **all** project intervals for that run. Omitting `--poll-seconds` uses the saved intervals; the override does not change them, and `projects list`/`status` still display the saved values. Remove this flag from old launch commands to use per-project intervals. `murphy run --once` performs one synchronous scheduling pass, runs at most one task and waits for it to finish; it does not fill parallel slots.
+
+`murphy run` defaults to at most **two simultaneously executing projects**, with **one active command per project**. Change the bound for that run:
+
+```bash
+murphy run --max-parallel-projects 2
+murphy run --max-parallel-projects 1  # Fully serial operation
+```
+
+The coordinator polls projects, processes global controls and publishes reports. Each active project runs in its own executor process with fresh database connections and isolated repository configuration. Dispatch selects the oldest eligible queued command, skipping projects that are already active; order within a project is preserved. A queued command in a busy project does not prevent a different project from using a free slot.
+
+Worktrees isolate Git working files, not host resources. Projects can share Docker services, databases, ports, CPU/RAM and account limits. Use a limit of `1` when their tests or workflows require exclusive shared infrastructure. Direct Codex runs outside Murphy are not covered by its scheduling.
 
 Commands receive installation-wide IDs, shown in `murphy status`. Newly discovered commands are enrolled by comment creation time/ID; already-enrolled commands keep their durable order. A repository temporarily unavailable to polling retains its cursor and joins the queue on recovery. This is discovery order, not a promise of perfect GitHub-wide chronology during outages.
 
@@ -189,14 +200,16 @@ Controls work locally or as whole comments in connected repositories, including 
 
 | Local command | GitHub comment | Effect |
 | --- | --- | --- |
-| `murphy pause` | `/murphy pause` | Let the current turn finish; hold all projects. |
+| `murphy pause` | `/murphy pause` | Let active turns finish; hold new dispatches in all projects. |
 | `murphy resume` | `/murphy resume` | Retry blocked commands after cleanup; resume after all unknown outcomes are resolved. |
 | `murphy cancel 12` | `/murphy cancel 12` | Cancel the global command ID, even in another project. |
 | `murphy status` | — | Inspect projects, commands and pause state. |
 
-Stop the foreground worker with Ctrl+C or SIGTERM. It cancels/drains its descendants before releasing the slot. Partial edits and commits remain available. One inherited lock at `~/.local/state/murphy/worker.lock` covers all Murphy workers and descendants, including legacy workers and other `--state-dir` installations. Direct Codex runs outside Murphy are not governed by this lock.
+Stop the foreground worker with Ctrl+C or SIGTERM. It stops all active project executors and drains their descendants before releasing the coordinator lock. Partial edits and commits remain available. One inherited lock at `~/.local/state/murphy/worker.lock` covers all Murphy workers and descendants, including legacy workers and other `--state-dir` installations. Direct Codex runs outside Murphy are not governed by this lock.
 
-An unclean exit, timeout, changed checkout/session or uncertain execution marks the command `unknown` and holds **all projects**. Never replay it automatically. With the worker stopped, inspect its saved execution JSONL/stderr, exact session and surviving processes, then explicitly resolve:
+A dispatch reservation is persisted before starting an executor. An unclean executor exit, timeout, changed checkout/session or uncertain execution marks the command `unknown` and blocks **new dispatches across all projects**; other already active turns may finish. A dirty source checkout has the same global scheduling hold. Cancellation/timeout drains only the affected execution, not another active project. Coordinator failure drains all active executions; uncertain results require reconciliation. If the coordinator is killed, surviving executors detect its loss, drain their descendants and record unknown outcomes. Interrupted reservations are reconciled as unknown on restart, never automatically replayed.
+
+With the worker stopped, inspect the affected command's saved execution JSONL/stderr, exact session and surviving processes, then explicitly resolve:
 
 ```bash
 murphy resolve 12 --outcome failed --note 'Inspected logs and confirmed all descendants exited.'
@@ -250,9 +263,9 @@ python3 tests/check_sandbox.py --codex codex --separate-account
 
 The separate-account sandbox check uses fictional GitHub CLI credentials to exercise real worktree editing/committing, scoped Git credential retrieval and GitHub identity reads inside the native sandbox. It makes no model calls or real GitHub requests.
 
-A controlled live pilot requires explicit authorization: use disposable repositories with your own credentials, a separate state directory and the intended base. For separate-account qualification, also use an authorized second account: verify only owner comments trigger work, reports/PRs/pushes belong to the executor, commit attribution matches, and normal human Git/GitHub settings remain unchanged. Start with the inspection-only example; verify the report and session, then authorize a small edit/test/commit/PR task and a continuation. Confirm one UUID, isolated worktrees, global serial order across two projects and stop/recovery behavior. Do not publish, merge or deploy as part of this pilot. This release preparation does not claim a live multi-project/two-account pilot was performed.
+A controlled live pilot requires explicit authorization: use disposable repositories with your own credentials, a separate state directory and the intended base. For separate-account qualification, also use an authorized second account: verify only owner comments trigger work, reports/PRs/pushes belong to the executor, commit attribution matches, and normal human Git/GitHub settings remain unchanged. Start with the inspection-only example; verify the report and session, then authorize a small edit/test/commit/PR task and a continuation. Confirm a stable UUID per continued task, isolated worktrees, the configured concurrency bound, per-project order and stop/recovery behavior. Exercise the serial override for projects with shared infrastructure. Do not publish, merge or deploy as part of this pilot. This release preparation does not claim a live multi-project/two-account pilot was performed.
 
-Automatic merge/deployment, a broker, dashboard, parallel execution, native Windows support and service packaging are outside this candidate.
+Automatic merge/deployment, a broker, dashboard, parallel execution within one project, native Windows support and service packaging are outside this candidate.
 
 ## License
 

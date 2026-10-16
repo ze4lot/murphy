@@ -1,14 +1,10 @@
-"""One owner, an optional executor account and one durable scheduling order.
-
-The prototype executor remains single-project. Only this serial coordinator
-switches its configuration; scoped calls restore the active project's context
-when polling other projects during a turn. No threads or concurrent executors.
-"""
+"""One coordinator, a durable queue and bounded execution in isolated processes."""
 from __future__ import annotations
 
 import contextlib
 from dataclasses import asdict
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import shutil
@@ -109,10 +105,14 @@ class ProjectGitHub(b.GitHub):
 class ProjectWorker(b.Worker):
     def __init__(self, manager, *args, **kwargs):
         self.manager = manager
+        self.execution_parent = None
         super().__init__(*args, **kwargs)
 
     def poll(self):
-        self.manager.pump()
+        if self.execution_parent is None:
+            self.manager.pump()
+        elif os.getppid() != self.execution_parent:
+            raise RuntimeError('Coordinator disappeared; execution must be reconciled.')
 
     def verify_comment(self, row):
         # A repository deleted/replaced under the same name is a new identity.
@@ -158,8 +158,13 @@ class Manager:
         self.timeout = 600
         self.last_identity_check = float('-inf')
         self.account_ready = False
+        self.max_parallel_projects = 2
+        self.active = {}  # project ID -> (executor process, project command ID)
+        self.owner_pid = os.getpid()
 
     def close(self):
+        if os.getpid() == self.owner_pid and self.active:
+            self.stop_executions()
         for _, state, _ in self.projects.values():
             state.db.close()
         self.db.close()
@@ -428,15 +433,117 @@ class Manager:
             with project_config(config):
                 worker.reports()
 
-    def tick(self, fd):
+    def drain_orphans(self):
+        # A dead executor's detached children are adopted by this subreaper.
+        # Never inspect/signal descendants of an executor that is still alive.
+        protected = {process.pid for process, _ in self.active.values()}
+        while children := b.descendants(exclude=protected):
+            for pid, (status, born) in children.items():
+                if status == 'Z':
+                    with contextlib.suppress(ChildProcessError):
+                        os.waitpid(pid, os.WNOHANG)
+                else:
+                    b.signal_child(pid, born, signal.SIGKILL)
+            time.sleep(0.05)
+
+    def reap(self):
+        for project, (process, command) in list(self.active.items()):
+            if process.is_alive():
+                continue
+            process.join()
+            del self.active[project]
+            state = self.projects[project][1]
+            if state.row(command)['state'] == 'running':
+                state.finish(command, 'unknown', 'Executor exited without a definite outcome; '
+                             'inspect logs and reconcile before resuming. No automatic replay.')
+            process.close()
+        self.drain_orphans()
+
+    def execute_project(self, project, command, fd, parent):
+        # Fork retains the lock FD and test doubles, but no live SQLite handles
+        # are reused. Each executor is its own subreaper and has one CONFIG.
+        worker = None
+        stopping = self.stop
+        def stop(*_):
+            nonlocal stopping
+            stopping = True
+            if worker is not None:
+                worker.stop = True
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            signal.signal(sig, stop)
+        self.close()
+        manager = Manager(self.directory)
+        manager.timeout = self.timeout
+        try:
+            os.setsid()
+            b.subreaper()
+            manager.load()
+            config, state, worker = manager.projects[project]
+            worker.execution_parent = parent
+            worker.stop = stopping or self.stop
+            with project_config(config):
+                try:
+                    worker.poll()  # Check coordinator before any preparation.
+                    worker.execute(state.row(command), fd)
+                except BaseException as error:
+                    state.finish(command, 'unknown', 'Executor interrupted: ' + str(error))
+        finally:
+            manager.drain_orphans()
+            manager.close()
+
+    def start_execution(self, project, command, fd):
+        state = self.projects[project][1]
+        # Reserve before forking: a crash anywhere after this point is unknown,
+        # never an apparently queued command eligible for automatic replay.
+        with state.db:
+            state.db.execute("UPDATE commands SET state='running' WHERE id=?", (command,))
+        process = multiprocessing.get_context('fork').Process(
+            target=self.execute_project, args=(project, command, fd, os.getpid()))
+        try:
+            process.start()
+        except BaseException:
+            state.finish(command, 'unknown', 'Executor launch failed; reconcile before resuming.')
+            raise
+        self.active[project] = process, command
+
+    def stop_executions(self, uncertain=False):
+        affected = [(self.projects[project][1], command) for project, (_, command) in self.active.items()
+                    if self.projects[project][1].row(command)['state'] == 'running']
+        for process, _ in self.active.values():
+            if process.is_alive():
+                process.terminate()
+        deadline = time.monotonic() + 5
+        while self.active:
+            if time.monotonic() >= deadline:
+                for process, _ in self.active.values():
+                    if process.is_alive():
+                        process.kill()
+            self.reap()
+            if self.active:
+                time.sleep(0.05)
+        self.drain_orphans()
+        if uncertain:
+            for state, command in affected:
+                state.finish(command, 'unknown', 'Coordinator failed during execution; '
+                             'descendants drained. Reconcile before resuming.')
+
+    def tick(self, fd, background=False):
+        self.reap()
         if not self.pump():
             return
         self.reports()
         if self.stop or self.setting('paused') == '1' or self.unknown():
             return
         for ticket in self.db.execute('SELECT id FROM queue ORDER BY id').fetchall():
+            if background and (len(self.active) >= self.max_parallel_projects or
+                               self.setting('paused') == '1' or self.unknown()):
+                break
             config, _, worker, row = self.command(ticket['id'])
-            if row['state'] == 'queued':
+            project = config.repository_id
+            if row['state'] == 'queued' and project not in self.active:
+                if background:
+                    self.start_execution(project, row['id'], fd)
+                    continue
                 with project_config(config):
                     worker.execute(row, fd)
                 return
@@ -447,6 +554,8 @@ class Manager:
             worker.stop = True
 
     def run(self, once=False):
+        if type(self.max_parallel_projects) is not int or self.max_parallel_projects < 1:
+            raise ValueError('Maximum parallel projects must be a whole number >= 1.')
         self.initialized()
         self.account.verify()
         for name in ('git', 'gh', 'codex'):
@@ -462,12 +571,17 @@ class Manager:
             previous = {sig: signal.signal(sig, self.request_stop) for sig in (signal.SIGINT, signal.SIGTERM)}
             try:
                 while not self.stop:
-                    self.tick(fd)
+                    self.tick(fd, background=not once)
                     if once:
                         self.reports()
                         break
                     time.sleep(0.2)
+            except BaseException:
+                self.set_paused(True)
+                self.stop_executions(uncertain=True)
+                raise
             finally:
+                self.stop_executions()
                 for sig, handler in previous.items():
                     signal.signal(sig, handler)
         return 2 if self.unknown() else 0

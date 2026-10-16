@@ -15,7 +15,7 @@ def main():
     # Preserve the prototype's explicit configuration commands and saved state.
     if '--config' in sys.argv[1:]:
         return bridge.main()
-    parser = argparse.ArgumentParser(description='Run GitHub tasks locally, one at a time across your projects.')
+    parser = argparse.ArgumentParser(description='Run GitHub tasks locally, one at a time per project.')
     parser.add_argument('--version', action='version', version='murphy ' + __version__)
     parser.add_argument('--state-dir', help='Private installation state (default: ~/.local/state/murphy/manager)')
     sub = parser.add_subparsers(dest='action', required=True)
@@ -43,6 +43,8 @@ def main():
     run.add_argument('--poll-seconds', type=float,
                      help='Override all saved project intervals for this run')
     run.add_argument('--timeout', type=float, default=600)
+    run.add_argument('--max-parallel-projects', type=int, default=2,
+                     help='Maximum simultaneously executing projects (default: 2; use 1 for serial work)')
     register = sub.add_parser('register', help='Register a clean task checkout and issue/PR aliases')
     register.add_argument('name')
     register.add_argument('--project', required=True, help='Connected owner/repository')
@@ -100,6 +102,7 @@ def main():
         elif args.action == 'run':
             manager.poll_seconds = args.poll_seconds
             manager.timeout = args.timeout
+            manager.max_parallel_projects = args.max_parallel_projects
             return manager.run(args.once)
         elif args.action == 'status':
             print(json.dumps(manager.status(), indent=2))

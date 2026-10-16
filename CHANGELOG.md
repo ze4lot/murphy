@@ -6,7 +6,8 @@
 - Setup from the signed-in GitHub account; only that immutable owner ID can issue commands. Default same-account execution or optional `init --separate-account` with one separate executor across all projects.
 - Isolated executor GitHub login, process-scoped HTTPS credentials and commit author/committer metadata, with no human-account fallback. `auth status` and same-executor `auth login` recovery; existing installations/sessions are not rebound.
 - Repository discovery, explicit project connection, managed clones or existing checkouts and automatic base/ID detection.
-- Multiple repositories share a persistent serial scheduling order and global controls. Tasks/sessions/checkpoints remain isolated per project.
+- Multiple repositories share a persistent queue and global controls; execution remains serial within each project. Tasks/sessions/checkpoints remain isolated per project.
+- Bounded parallel execution across projects: two by default, configurable with `run --max-parallel-projects` (1 for fully serial work). Separate executor processes preserve configuration/credential isolation, per-project order, targeted cancellation, descendant draining and conservative restart/unknown-outcome handling.
 - Per-project polling intervals via `projects add -i/--interval`, defaulting to 60 seconds for new and existing projects. Saved intervals appear in project listings/status; explicit `run --poll-seconds` remains a temporary override for all projects.
 - Account revalidation, global handling of uncertain outcomes, retained cancellation/draining and report-only retry.
 - Dirty source checkout guard: pause before task work, report file names once on the triggering issue, and retry the same blocked command only after explicit resume. Saved task changes remain resumable.
@@ -16,4 +17,4 @@
 - Legacy explicit-JSON commands and scoped session state remain supported without implicit migration.
 - Isolated installation/archive/reproducibility checks, behavior coverage and Linux Python 3.11/3.12 CI.
 
-Limitations: experimental Linux/WSL CLI; polling order during outages is discovery order; no project removal/reconfiguration command, service, parallel execution, automatic merge/deploy or published package/tag/release. Live multi-project operation still needs an authorized pilot.
+Limitations: experimental Linux/WSL CLI; polling order during outages is discovery order; no project removal/reconfiguration command, service, parallel execution within one project, automatic merge/deploy or published package/tag/release. Live multi-project operation still needs an authorized pilot.
