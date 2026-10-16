@@ -139,7 +139,7 @@ class Manager:
             CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS projects (
                 id INTEGER PRIMARY KEY, repository TEXT NOT NULL UNIQUE COLLATE NOCASE,
-                config TEXT NOT NULL
+                config TEXT NOT NULL, poll_interval INTEGER NOT NULL DEFAULT 60
             );
             CREATE TABLE IF NOT EXISTS queue (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -147,13 +147,16 @@ class Manager:
                 UNIQUE(project, command)
             );
         ''')
+        if 'poll_interval' not in {row['name'] for row in self.db.execute('PRAGMA table_info(projects)')}:
+            with self.db:
+                self.db.execute('ALTER TABLE projects ADD COLUMN poll_interval INTEGER NOT NULL DEFAULT 60')
         saved = self.setting('account')
         self.account = Account(json.loads(saved)) if saved else None
         self.projects = {}
         self.stop = False
-        self.poll_seconds = 30
+        self.poll_seconds = None  # Optional run-wide override; otherwise use saved project intervals.
         self.timeout = 600
-        self.last_identity_check = 0
+        self.last_identity_check = float('-inf')
         self.account_ready = False
 
     def close(self):
@@ -242,7 +245,10 @@ class Manager:
                 state.db.close()
                 raise
             worker = ProjectWorker(self, state, ProjectGitHub(self, row['id']),
-                                   codex=config.codex, poll_seconds=self.poll_seconds, timeout=self.timeout)
+                                   codex=config.codex,
+                                   poll_seconds=(self.poll_seconds if self.poll_seconds is not None
+                                                 else row['poll_interval']), timeout=self.timeout)
+            worker.last_poll = float('-inf')  # Poll immediately even when interval exceeds machine uptime.
             self.projects[row['id']] = config, state, worker
 
     def available(self):
@@ -281,7 +287,9 @@ class Manager:
         self.sync_queue()
         return [self.ticket(config.repository_id, command) for command in commands]
 
-    def add(self, repository, checkout=None, base=None, model=None):
+    def add(self, repository, checkout=None, base=None, model=None, interval=60):
+        if type(interval) is not int or interval < 1:
+            raise ValueError('Project poll interval must be a whole number of seconds >= 1.')
         self.initialized()
         if not b.re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]+', repository):
             raise ValueError('Use a GitHub owner/repository name.')
@@ -333,8 +341,8 @@ class Manager:
                 state.configure_autostart(source, state.directory / 'worktrees', base, model,
                                           latest['id'] if latest else 0)
             with self.db:
-                self.db.execute('INSERT INTO projects VALUES (?, ?, ?)',
-                                (repo['id'], repository, json.dumps(asdict(config))))
+                self.db.execute('INSERT INTO projects (id, repository, config, poll_interval) VALUES (?, ?, ?, ?)',
+                                (repo['id'], repository, json.dumps(asdict(config)), interval))
         finally:
             state.db.close()
         self.load()
@@ -386,7 +394,8 @@ class Manager:
     def pump(self):
         if self.stop:
             return False
-        if time.monotonic() - self.last_identity_check >= self.poll_seconds:
+        identity_interval = min((worker.poll_seconds for _, _, worker in self.projects.values()), default=60)
+        if time.monotonic() - self.last_identity_check >= identity_interval:
             self.last_identity_check = time.monotonic()
             try:
                 self.account.verify()
@@ -466,7 +475,8 @@ class Manager:
     def status(self):
         self.load()
         self.sync_queue()
-        projects = [dict(row) for row in self.db.execute('SELECT id,repository FROM projects ORDER BY id')]
+        projects = [dict(row) for row in self.db.execute(
+            'SELECT id,repository,poll_interval AS interval FROM projects ORDER BY id')]
         commands = []
         for ticket in self.db.execute('SELECT * FROM queue ORDER BY id').fetchall():
             config, _, _, row = self.command(ticket['id'])

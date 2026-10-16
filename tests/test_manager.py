@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Multi-project behavior with temporary Git repositories and fake external APIs."""
+import io
 import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -12,6 +14,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from murphy import bridge as b
+from murphy import cli
 from murphy.manager import Account, Manager
 
 FAKE = str(ROOT / 'tests/fake_codex.py')
@@ -95,7 +98,7 @@ class ManagerTests(unittest.TestCase):
             return []
         raise AssertionError((path, method))
 
-    def add_project(self, name, number):
+    def project_source(self, name, number):
         repository = 'example/' + name
         self.repos[repository] = {'id': number, 'full_name': repository, 'default_branch': 'main',
                                   'permissions': {'push': True}}
@@ -107,7 +110,12 @@ class ManagerTests(unittest.TestCase):
         subprocess.run(['git', '-C', str(source), '-c', 'user.name=Test User',
                         '-c', 'user.email=user@example.invalid', 'commit', '--allow-empty', '-qm', 'fixture'], check=True)
         subprocess.run(['git', '-C', str(source), 'update-ref', 'refs/remotes/origin/main', 'HEAD'], check=True)
-        self.manager.add(repository, source)
+        return source
+
+    def add_project(self, name, number, interval=60):
+        source = self.project_source(name, number)
+        repository = 'example/' + name
+        self.manager.add(repository, source, interval=interval)
         return self.manager.projects[number]
 
     def comment(self, repository, ident, prompt='read', verb='start', author=3001, item=7):
@@ -117,7 +125,7 @@ class ManagerTests(unittest.TestCase):
                    'user': {'id': author, 'type': 'User'}}
         self.comments[repository].append(comment)
         for _, _, worker in self.manager.projects.values():
-            worker.last_poll = 0
+            worker.last_poll = float('-inf')
         return comment
 
     def tick(self):
@@ -134,6 +142,76 @@ class ManagerTests(unittest.TestCase):
             self.manager.init()
         with self.assertRaisesRegex(ValueError, 'already connected'):
             self.manager.add('example/one', self.root / 'one')
+
+    def test_project_intervals_survive_restart_and_are_visible(self):
+        self.add_project('one', 1)
+        self.add_project('two', 2, interval=120)
+        expected = [{'id': 1, 'repository': 'example/one', 'interval': 60},
+                    {'id': 2, 'repository': 'example/two', 'interval': 120}]
+        self.assertEqual(self.manager.status()['projects'], expected)
+        reopened = Manager(self.manager.directory)
+        self.addCleanup(reopened.close)
+        self.assertEqual(reopened.status()['projects'], expected)
+        self.assertEqual([worker.poll_seconds for _, _, worker in reopened.projects.values()], [60, 120])
+
+    def test_add_cli_accepts_default_short_and_long_interval_options(self):
+        for number, options in ((1, []), (2, ['-i', '15']), (3, ['--interval', '120'])):
+            source = self.project_source(str(number), number)
+            argv = ['murphy', '--state-dir', str(self.manager.directory), 'projects', 'add',
+                    'example/' + str(number), '--checkout', str(source), *options]
+            with patch.object(sys, 'argv', argv), patch('sys.stdout', new_callable=io.StringIO):
+                self.assertEqual(cli.main(), 0)
+        self.assertEqual([project['interval'] for project in self.manager.status()['projects']], [60, 15, 120])
+
+    def test_project_polling_obeys_independent_intervals(self):
+        self.add_project('one', 1, interval=20)
+        self.add_project('two', 2, interval=60)
+        self.comment('example/one', 101)
+        self.comment('example/two', 102)
+        with patch.object(self, 'github_api', wraps=self.github_api) as api:
+            with patch('murphy.manager.time.monotonic', return_value=0) as clock:
+                for instant in (0, 19, 20, 39, 40, 59, 60):
+                    clock.return_value = instant
+                    self.manager.pump()
+        polls = [call.args[0] for call in api.call_args_list if '/comments?since=' in call.args[0]]
+        self.assertEqual(sum('/example/one/' in path for path in polls), 4)
+        self.assertEqual(sum('/example/two/' in path for path in polls), 2)
+        self.assertEqual(len(self.manager.status()['commands']), 2)  # Repeated discovery stays deduplicated.
+
+    def test_old_project_registry_gains_default_without_losing_state(self):
+        _, state, _ = self.add_project('one', 1)
+        self.comment('example/one', 101)
+        self.tick()
+        expected = self.manager.status()
+        baseline = state.setting('baseline')
+        self.manager.close()
+        with sqlite3.connect(self.root / 'state/manager.sqlite') as old:
+            old.execute('ALTER TABLE projects DROP COLUMN poll_interval')
+        reopened = Manager(self.root / 'state')
+        self.addCleanup(reopened.close)
+        self.assertEqual(reopened.status(), expected)
+        self.assertEqual(reopened.projects[1][1].setting('baseline'), baseline)
+        self.assertEqual(reopened.projects[1][2].poll_seconds, 60)
+
+    def test_run_override_does_not_change_saved_project_intervals(self):
+        self.add_project('one', 1, interval=120)
+        reopened = Manager(self.manager.directory)
+        self.addCleanup(reopened.close)
+        reopened.poll_seconds = 5
+        self.assertEqual(reopened.status()['projects'][0]['interval'], 120)
+        self.assertEqual(reopened.projects[1][2].poll_seconds, 5)
+        normal = Manager(self.manager.directory)
+        self.addCleanup(normal.close)
+        normal.load()
+        self.assertEqual(normal.projects[1][2].poll_seconds, 120)
+
+    def test_invalid_project_interval_has_no_setup_side_effects(self):
+        with patch.object(self.manager.account, 'verify') as verify:
+            for interval in (0, -1, 1.5, True):
+                with self.assertRaisesRegex(ValueError, 'whole number of seconds'):
+                    self.manager.add('example/one', interval=interval)
+            verify.assert_not_called()
+        self.assertEqual(self.manager.status()['projects'], [])
 
     def separate_manager(self):
         manager = Manager(self.root / 'separate-state')
