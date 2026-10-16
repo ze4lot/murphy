@@ -1,6 +1,7 @@
 """User-facing setup and multi-project commands."""
 import argparse
 import json
+import math
 import os
 import sqlite3
 import subprocess
@@ -35,9 +36,12 @@ def main():
     add.add_argument('--checkout', help='Use an existing local checkout without switching or cleaning it')
     add.add_argument('--base', help='Task base branch (default: GitHub default branch)')
     add.add_argument('--model', help='Optional Codex model for new tasks')
+    add.add_argument('-i', '--interval', type=int, default=60,
+                     help='Poll this repository every N seconds (default: 60, minimum: 1)')
     run = sub.add_parser('run', help='Watch all connected projects and execute the shared queue')
     run.add_argument('--once', action='store_true')
-    run.add_argument('--poll-seconds', type=float, default=30)
+    run.add_argument('--poll-seconds', type=float,
+                     help='Override all saved project intervals for this run')
     run.add_argument('--timeout', type=float, default=600)
     register = sub.add_parser('register', help='Register a clean task checkout and issue/PR aliases')
     register.add_argument('name')
@@ -67,7 +71,9 @@ def main():
     os.umask(0o077)
     manager = None
     try:
-        if args.action == 'run' and (args.poll_seconds < 1 or args.timeout <= 0):
+        if args.action == 'run' and ((args.poll_seconds is not None and
+                                     (not math.isfinite(args.poll_seconds) or args.poll_seconds < 1)) or
+                                    args.timeout <= 0):
             raise ValueError('Poll interval >= 1s and positive timeout required.')
         manager = Manager(args.state_dir)
         if args.action == 'init':
@@ -89,7 +95,8 @@ def main():
             else:
                 # Exclude changes to the project registry during a worker run.
                 with bridge.lock(manager):
-                    print('Connected ' + manager.add(args.repository, args.checkout, args.base, args.model))
+                    print('Connected ' + manager.add(args.repository, args.checkout, args.base, args.model,
+                                                     args.interval))
         elif args.action == 'run':
             manager.poll_seconds = args.poll_seconds
             manager.timeout = args.timeout

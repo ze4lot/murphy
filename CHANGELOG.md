@@ -7,6 +7,7 @@
 - Isolated executor GitHub login, process-scoped HTTPS credentials and commit author/committer metadata, with no human-account fallback. `auth status` and same-executor `auth login` recovery; existing installations/sessions are not rebound.
 - Repository discovery, explicit project connection, managed clones or existing checkouts and automatic base/ID detection.
 - Multiple repositories share a persistent serial scheduling order and global controls. Tasks/sessions/checkpoints remain isolated per project.
+- Per-project polling intervals via `projects add -i/--interval`, defaulting to 60 seconds for new and existing projects. Saved intervals appear in project listings/status; explicit `run --poll-seconds` remains a temporary override for all projects.
 - Account revalidation, global handling of uncertain outcomes, retained cancellation/draining and report-only retry.
 - Dirty source checkout guard: pause before task work, report file names once on the triggering issue, and retry the same blocked command only after explicit resume. Saved task changes remain resumable.
 - Explicit `waiting_for_user` turn outcomes free the serial queue for other issues while retaining sessions/worktrees; authenticated continuations resume the same session. Structured final results are validated on both start and resume.

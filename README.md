@@ -88,6 +88,16 @@ To use your existing checkout or another task base:
 murphy projects add example/api --checkout /path/to/api --base develop
 ```
 
+Each connected repository has its own polling interval, saved in seconds. The default is **60 seconds**; set a different whole number (minimum 1) when adding it:
+
+```bash
+murphy projects add example/website -i 120
+murphy projects add example/tools --interval 30
+murphy projects list
+```
+
+`projects list` and `status` show each project's saved `interval`. Existing connected projects receive the 60-second default on upgrade without resetting activation cursors, commands or sessions. Different intervals affect when comments are discovered, not parallelism: all projects still share one serial execution queue.
+
 The source checkout is not switched, cleaned, reset or copied. Task worktrees live outside it. A managed clone failure preserves partial files; inspect them and explicitly use `--checkout` after fixing the problem. Connecting a repository twice fails without moving its activation boundary. An empty repository needs an initial commit before connection. A non-default task base must already exist on the remote.
 
 Choose external tool wrappers once, if needed:
@@ -159,11 +169,13 @@ Trusted local operators can use `murphy enqueue TASK start|continue --project OW
 
 ## Queue, stop and recovery
 
-Defaults: poll every 30 seconds, execution timeout 600 seconds. While idle Murphy calls GitHub, not a model. Change them with `murphy run --poll-seconds 5 --timeout 180`. `murphy run --once` performs one scheduling pass and runs at most one task.
+Defaults: use each project's saved interval (60 seconds unless specified at connection), execution timeout 600 seconds. While idle Murphy calls GitHub, not a model. Every project is first polled on worker startup, then independently at its interval, including while another project executes. Controls posted on GitHub are discovered at the interval of the repository where they were posted; local controls do not wait for a GitHub poll.
+
+The existing `murphy run --poll-seconds 5 --timeout 180` explicitly overrides **all** project intervals for that run. Omitting `--poll-seconds` uses the saved intervals; the override does not change them, and `projects list`/`status` still display the saved values. Remove this flag from old launch commands to use per-project intervals. `murphy run --once` performs one scheduling pass and runs at most one task.
 
 Commands receive installation-wide IDs, shown in `murphy status`. Newly discovered commands are enrolled by comment creation time/ID; already-enrolled commands keep their durable order. A repository temporarily unavailable to polling retains its cursor and joins the queue on recovery. This is discovery order, not a promise of perfect GitHub-wide chronology during outages.
 
-If the periodic executor check fails because authentication or the API is unavailable, queued tasks stay queued. Scheduling resumes after a successful check; the normal poll interval also controls these retries.
+If the periodic executor check fails because authentication or the API is unavailable, queued tasks stay queued. Scheduling resumes after a successful check; the shortest effective project interval controls these periodic checks and retries. Checks immediately before GitHub operations remain in place.
 
 Before a task starts or continues, Murphy checks the connected source checkout for staged, unstaged and untracked files (ignored files do not block it). Uncommitted changes mark the command `blocked` and pause the shared queue before any fetch, new task worktree or model call. The triggering issue receives a report with relative file names, never file contents; long lists are shortened with a notice. Publication retries reconcile the same comment and do not repeatedly notify while paused. The pause and command survive restarts.
 
