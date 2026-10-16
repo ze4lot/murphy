@@ -495,7 +495,7 @@ def lock(state):
         yield handle.fileno()
 
 
-def descendants():
+def descendants(exclude=()):
     """Linux subreaper also adopts daemonized grandchildren; skip/reap zombies."""
     entries = {}
     for path in Path('/proc').glob('[0-9]*/stat'):
@@ -509,7 +509,7 @@ def descendants():
     while pending:
         parent = pending.pop()
         for pid, (ppid, status, born) in entries.items():
-            if ppid == parent and pid not in found:
+            if ppid == parent and pid not in found and pid not in exclude:
                 found[pid] = (status, born)
                 pending.append(pid)
     return found
@@ -705,6 +705,9 @@ class Worker:
         return True
 
     def execute(self, row, fd):
+        if self.stop or self.state.row(row['id'])['cancel']:
+            self.state.finish(row['id'], 'cancelled', 'Cancelled before execution')
+            return
         try:
             self.verify_comment(row)
         except Exception as error:
@@ -750,6 +753,9 @@ class Worker:
             self.state.db.execute("UPDATE commands SET state='running',started=COALESCE(started,?),head=?,thread_id=?,reasoning=? WHERE id=?",
                                   (now(), before['head'], task['thread_id'], task['reasoning'], row['id']))
         try:
+            if self.stop or self.state.row(row['id'])['cancel']:
+                self.state.finish(row['id'], 'cancelled', 'Cancelled before model invocation')
+                return
             self.run_codex(row, task, before, fd)
         except Exception as error:
             self.state.finish(row['id'], 'unknown', f'Execution outcome uncertain: {error}')

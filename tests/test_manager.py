@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """Multi-project behavior with temporary Git repositories and fake external APIs."""
+import contextlib
 import io
 import json
 import os
 from pathlib import Path
 import sqlite3
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -132,6 +135,328 @@ class ManagerTests(unittest.TestCase):
         b.subreaper()
         with b.lock(self.manager) as fd:
             self.manager.tick(fd)
+
+    @contextlib.contextmanager
+    def background(self, timeout=15):
+        self.manager.timeout = timeout
+        b.subreaper()
+        with b.lock(self.manager) as fd:
+            try:
+                yield fd
+            finally:
+                self.manager.stop_executions()
+        self.assertFalse(b.descendants())
+
+    def wait_for(self, predicate, fd=None):
+        deadline = time.monotonic() + 8
+        while not predicate():
+            if time.monotonic() > deadline:
+                self.fail('Timed out waiting for execution: ' + str(self.manager.status()['commands']))
+            if fd is not None:
+                self.manager.tick(fd, background=True)
+            time.sleep(0.02)
+
+    def task_path(self, state, command=1):
+        row = state.row(command)
+        return Path(json.loads(row['plan'])['cwd']) if row and row['plan'] else state.directory / 'not-started'
+
+    def release(self, state, command=1):
+        (self.task_path(state, command) / 'execution-release').touch()
+
+    def test_parallel_projects_respect_global_limit_and_project_order(self):
+        _, first, _ = self.add_project('one', 1)
+        _, second, _ = self.add_project('two', 2)
+        _, third, _ = self.add_project('three', 3)
+        for repo, ident, item in (('one', 101, 7), ('one', 102, 8), ('two', 103, 7), ('three', 104, 7)):
+            self.comment('example/' + repo, ident, 'WAIT_FOR_TEST_RELEASE', item=item)
+        with self.background() as fd:
+            self.manager.tick(fd, background=True)
+            self.wait_for(lambda: all((self.task_path(s) / 'execution-started').exists()
+                                     for s in (first, second)), fd)
+            self.assertEqual(set(self.manager.active), {1, 2})
+            self.assertEqual(first.row(2)['state'], 'queued')
+            self.assertEqual(third.row(1)['state'], 'queued')
+            self.release(first)
+            self.wait_for(lambda: (self.task_path(first, 2) / 'execution-started').exists(), fd)
+            self.assertEqual(set(self.manager.active), {1, 2})
+            self.assertGreaterEqual(first.row(2)['started'], first.row(1)['finished'])
+            self.release(first, 2)
+            self.wait_for(lambda: (self.task_path(third) / 'execution-started').exists(), fd)
+            self.assertEqual(set(self.manager.active), {2, 3})
+            self.release(second)
+            self.release(third)
+            self.wait_for(lambda: not self.manager.active, fd)
+            self.manager.reports()
+        self.assertTrue(all(c['state'] == 'succeeded' for c in self.manager.status()['commands']))
+        self.assertEqual(len(self.reported), 4)
+        self.assertEqual(len({s.row(1)['thread_id'] for s in (first, second, third)}), 3)
+        for repo, payload in self.reported:
+            state = {'example/one': first, 'example/two': second, 'example/three': third}[repo]
+            self.assertTrue(any(c['execution_id'] in payload['body'] for c in state.db.execute('SELECT * FROM commands')))
+        self.assertIs(b.CONFIG, self.previous)
+
+    def test_parallel_limit_one_keeps_projects_serial(self):
+        self.manager.max_parallel_projects = 1
+        _, first, _ = self.add_project('one', 1)
+        _, second, _ = self.add_project('two', 2)
+        self.comment('example/one', 101, 'WAIT_FOR_TEST_RELEASE')
+        self.comment('example/two', 102)
+        with self.background() as fd:
+            self.manager.tick(fd, background=True)
+            self.wait_for(lambda: (self.task_path(first) / 'execution-started').exists(), fd)
+            self.assertEqual(second.row(1)['state'], 'queued')
+            self.release(first)
+            self.wait_for(lambda: second.row(1)['state'] == 'succeeded', fd)
+            self.assertGreaterEqual(second.row(1)['started'], first.row(1)['finished'])
+
+    def test_parallel_controls_cancel_only_target_and_pause_new_dispatches(self):
+        _, first, _ = self.add_project('one', 1)
+        _, second, _ = self.add_project('two', 2)
+        _, third, _ = self.add_project('three', 3)
+        self.comment('example/one', 101, 'WAIT_FOR_TEST_RELEASE DAEMON_FOREVER')
+        self.comment('example/two', 102, 'WAIT_FOR_TEST_RELEASE')
+        self.comment('example/three', 103)
+        with self.background() as fd:
+            self.manager.tick(fd, background=True)
+            self.wait_for(lambda: all((self.task_path(s) / 'execution-started').exists()
+                                     for s in (first, second)), fd)
+            model_pid = int((self.task_path(first) / 'execution-started').read_text())
+            self.comment('example/three', 104, '', 'pause')['body'] = '/murphy pause'
+            self.manager.tick(fd, background=True)
+            self.assertEqual(self.manager.setting('paused'), '1')
+            self.comment('example/three', 105, '', 'cancel 1')['body'] = '/murphy cancel 1'
+            self.wait_for(lambda: first.row(1)['state'] == 'cancelled', fd)
+            self.assertFalse(Path(f'/proc/{model_pid}').exists())
+            self.assertEqual(second.row(1)['state'], 'running')
+            self.assertEqual(third.row(1)['state'], 'queued')
+            self.comment('example/three', 106, '', 'resume')['body'] = '/murphy resume'
+            self.wait_for(lambda: third.row(1)['state'] == 'succeeded', fd)
+            self.assertEqual(second.row(1)['state'], 'running')
+            self.release(second)
+            self.wait_for(lambda: not self.manager.active, fd)
+
+    def test_executor_crash_drains_orphans_without_killing_another_project(self):
+        _, first, _ = self.add_project('one', 1)
+        _, second, _ = self.add_project('two', 2)
+        _, third, _ = self.add_project('three', 3)
+        self.comment('example/one', 101, 'WAIT_FOR_TEST_RELEASE DAEMON_FOREVER')
+        self.comment('example/two', 102, 'WAIT_FOR_TEST_RELEASE')
+        self.comment('example/three', 103)
+        with self.background() as fd:
+            self.manager.tick(fd, background=True)
+            self.wait_for(lambda: all((self.task_path(s) / 'execution-started').exists()
+                                     for s in (first, second)), fd)
+            model_pid = int((self.task_path(first) / 'execution-started').read_text())
+            self.manager.active[1][0].kill()
+            self.wait_for(lambda: first.row(1)['state'] == 'unknown', fd)
+            self.assertFalse(Path(f'/proc/{model_pid}').exists())
+            self.assertEqual(self.manager.setting('paused'), '1')
+            self.assertEqual(second.row(1)['state'], 'running')
+            self.assertEqual(third.row(1)['state'], 'queued')
+            self.release(second)
+            self.wait_for(lambda: not self.manager.active, fd)
+        reopened = Manager(self.manager.directory)
+        self.addCleanup(reopened.close)
+        self.assertEqual(reopened.run(once=True), 2)
+        self.assertEqual(first.row(1)['state'], 'unknown')
+        self.assertEqual(third.row(1)['state'], 'queued')
+
+    def test_waiting_project_frees_slot_and_continues_same_session(self):
+        _, first, _ = self.add_project('one', 1)
+        _, second, _ = self.add_project('two', 2)
+        _, third, _ = self.add_project('three', 3)
+        self.comment('example/one', 101, 'ASK_OWNER WRITE_TASK_FILE')
+        self.comment('example/two', 102, 'WAIT_FOR_TEST_RELEASE')
+        self.comment('example/three', 103, 'WAIT_FOR_TEST_RELEASE')
+        with self.background() as fd:
+            self.manager.tick(fd, background=True)
+            self.wait_for(lambda: (self.task_path(third) / 'execution-started').exists(), fd)
+            self.assertEqual(first.row(1)['state'], 'waiting_for_user')
+            thread = first.row(1)['thread_id']
+            self.comment('example/one', 104, 'Use option A. WRITE_TASK_FILE', 'continue')
+            self.manager.tick(fd, background=True)
+            self.assertEqual(first.row(2)['state'], 'queued')
+            self.release(third)
+            self.wait_for(lambda: first.row(2)['state'] == 'succeeded', fd)
+            self.assertEqual(first.row(2)['thread_id'], thread)
+            self.release(second)
+            self.wait_for(lambda: not self.manager.active, fd)
+
+    def test_shutdown_drains_all_active_project_descendants(self):
+        states = [self.add_project(name, i)[1] for i, name in ((1, 'one'), (2, 'two'))]
+        for i, name in ((101, 'one'), (102, 'two')):
+            self.comment('example/' + name, i, 'WAIT_FOR_TEST_RELEASE DAEMON_FOREVER')
+        with self.background() as fd:
+            self.manager.tick(fd, background=True)
+            self.wait_for(lambda: all((self.task_path(s) / 'execution-started').exists() for s in states), fd)
+            with self.assertRaisesRegex(ValueError, 'already held'), b.lock(self.manager):
+                pass
+            self.manager.request_stop()
+            self.manager.stop_executions()
+            self.assertFalse(self.manager.active)
+            self.assertFalse(b.descendants())
+            self.assertTrue(all(s.row(1)['state'] == 'cancelled' for s in states))
+
+    def test_parallel_timeout_holds_queue_and_does_not_replay(self):
+        _, first, _ = self.add_project('one', 1)
+        _, second, _ = self.add_project('two', 2)
+        self.comment('example/one', 101, 'WAIT_FOR_TEST_RELEASE DAEMON_FOREVER')
+        self.comment('example/two', 102)
+        with self.background(timeout=0.3) as fd:
+            self.manager.tick(fd, background=True)
+            self.wait_for(lambda: not self.manager.active, fd)
+            self.assertEqual(first.row(1)['state'], 'unknown')
+            self.assertEqual(second.row(1)['state'], 'succeeded')
+            self.assertEqual(self.manager.setting('paused'), '1')
+            self.manager.tick(fd, background=True)
+            self.assertEqual(len(list(first.directory.glob('*.jsonl'))), 1)
+
+    def test_dirty_source_blocks_dispatch_without_stopping_active_project(self):
+        _, first, _ = self.add_project('one', 1)
+        _, second, _ = self.add_project('two', 2)
+        self.add_project('three', 3)
+        (self.root / 'two/owner.txt').write_text('owner changes')
+        self.comment('example/one', 101, 'WAIT_FOR_TEST_RELEASE')
+        self.comment('example/two', 102)
+        self.comment('example/three', 103)
+        with self.background() as fd:
+            self.manager.tick(fd, background=True)
+            self.wait_for(lambda: second.row(1)['state'] == 'blocked', fd)
+            self.wait_for(lambda: (self.task_path(first) / 'execution-started').exists(), fd)
+            self.assertEqual(first.row(1)['state'], 'running')
+            self.assertEqual(self.manager.setting('paused'), '1')
+            self.assertFalse(list(second.directory.glob('*.jsonl')))
+            execution = second.row(1)['execution_id']
+            (self.root / 'two/owner.txt').unlink()
+            self.manager.control('resume')
+            self.wait_for(lambda: second.row(1)['state'] == 'succeeded', fd)
+            self.assertEqual(second.row(1)['execution_id'], execution)
+            self.release(first)
+            self.wait_for(lambda: not self.manager.active, fd)
+
+    def test_account_change_stops_and_marks_all_parallel_work_unknown(self):
+        states = [self.add_project(name, i)[1] for i, name in ((1, 'one'), (2, 'two'))]
+        for i, name in ((101, 'one'), (102, 'two')):
+            self.comment('example/' + name, i, 'WAIT_FOR_TEST_RELEASE DAEMON_FOREVER')
+        tick = self.manager.tick
+        def change(fd, background=False):
+            tick(fd, background)
+            if all((self.task_path(s) / 'execution-started').exists() for s in states):
+                self.user['id'] = 4001
+                self.manager.last_identity_check = float('-inf')
+        with patch.object(self.manager, 'tick', side_effect=change):
+            with self.assertRaisesRegex(ValueError, 'account changed'):
+                self.manager.run()
+        self.assertTrue(all(s.row(1)['state'] == 'unknown' for s in states))
+        self.assertFalse(self.manager.active)
+        self.assertFalse(b.descendants())
+
+    def test_coordinator_loss_drains_executors_and_retains_lock_until_safe(self):
+        states = [self.add_project(name, i)[1] for i, name in ((1, 'one'), (2, 'two'))]
+        for i, name in ((101, 'one'), (102, 'two')):
+            self.comment('example/' + name, i, 'WAIT_FOR_TEST_RELEASE DAEMON_FOREVER')
+        b.subreaper()
+        pid = os.fork()
+        if pid == 0:
+            try:
+                self.manager.close()
+                coordinator = Manager(self.manager.directory)
+                coordinator.timeout = 15
+                coordinator.run()
+            finally:
+                os._exit(0)
+        try:
+            self.wait_for(lambda: all((self.task_path(s) / 'execution-started').exists() for s in states))
+            for state in states:
+                model = (self.task_path(state) / 'execution-started').read_text()
+                lock_inode = self.manager.worker_lock.stat().st_ino
+                self.assertTrue(any(path.stat().st_ino == lock_inode
+                                    for path in Path('/proc', model, 'fd').iterdir()))
+            with self.assertRaisesRegex(ValueError, 'already held'), b.lock(self.manager):
+                pass
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+            self.wait_for(lambda: all(s.row(1)['state'] == 'unknown' for s in states))
+            # Executors have recorded their uncertain outcome; reap their exits.
+            self.manager.drain_orphans()
+            with b.lock(self.manager):
+                self.assertFalse(b.descendants())
+            self.assertEqual(self.manager.setting('paused'), '1')
+            self.assertTrue(all(len(list(s.directory.glob('*.jsonl'))) == 1 for s in states))
+        finally:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+            with contextlib.suppress(ChildProcessError):
+                os.waitpid(pid, 0)
+            self.manager.drain_orphans()
+
+    def test_interrupted_dispatch_reservation_is_unknown_after_restart(self):
+        _, state, _ = self.add_project('one', 1)
+        self.comment('example/one', 101)
+        self.manager.pump()
+        with state.db:
+            state.db.execute("UPDATE commands SET state='running' WHERE id=1")
+        reopened = Manager(self.manager.directory)
+        self.addCleanup(reopened.close)
+        self.assertEqual(reopened.run(once=True), 2)
+        self.assertEqual(state.row(1)['state'], 'unknown')
+        self.assertFalse(list(state.directory.glob('*.jsonl')))
+
+    def test_failed_executor_launch_is_unknown_and_never_requeued(self):
+        _, state, _ = self.add_project('one', 1)
+        self.comment('example/one', 101)
+        with self.background() as fd:
+            with patch('multiprocessing.process.BaseProcess.start', side_effect=RuntimeError('fork failed')):
+                with self.assertRaisesRegex(RuntimeError, 'fork failed'):
+                    self.manager.tick(fd, background=True)
+            self.assertEqual(state.row(1)['state'], 'unknown')
+            self.assertEqual(self.manager.setting('paused'), '1')
+            self.manager.tick(fd, background=True)
+            self.assertFalse(self.manager.active)
+            self.assertFalse(list(state.directory.glob('*.jsonl')))
+
+    def test_cancelled_dispatch_does_not_invoke_model(self):
+        _, state, _ = self.add_project('one', 1)
+        self.comment('example/one', 101)
+        self.manager.pump()
+        with state.db:
+            state.db.execute('UPDATE commands SET cancel=1 WHERE id=1')
+        with self.background() as fd:
+            self.manager.start_execution(1, 1, fd)
+            self.wait_for(lambda: not self.manager.active, fd)
+        self.assertEqual(state.row(1)['state'], 'cancelled')
+        self.assertFalse(list(state.directory.glob('*.jsonl')))
+        self.assertIsNone(state.row(1)['plan'])
+
+    def test_invalid_parallel_limit_rejected_before_external_work(self):
+        for value in (0, -1, 1.5):
+            self.manager.max_parallel_projects = value
+            with patch.object(self.manager.account, 'verify') as verify:
+                with self.assertRaisesRegex(ValueError, 'Maximum parallel projects'):
+                    self.manager.run()
+                verify.assert_not_called()
+
+    def test_separate_executor_identity_survives_parallel_project_processes(self):
+        self.manager = self.separate_manager()
+        _, first, _ = self.add_project('one', 1)
+        _, second, _ = self.add_project('two', 2)
+        for i, name in ((101, 'one'), (102, 'two')):
+            self.comment('example/' + name, i, 'WAIT_FOR_TEST_RELEASE COMMIT_EXECUTOR_FILE')
+        self.user = {'id': 4001, 'login': 'another-owner', 'type': 'User'}
+        with self.background() as fd:
+            self.manager.tick(fd, background=True)
+            self.wait_for(lambda: all((self.task_path(s) / 'execution-started').exists()
+                                     for s in (first, second)), fd)
+            self.release(first)
+            self.release(second)
+            self.wait_for(lambda: not self.manager.active, fd)
+        for state in (first, second):
+            self.assertEqual(state.row(1)['state'], 'succeeded')
+            author = subprocess.check_output(['git', '-C', str(self.task_path(state)), 'log', '-1',
+                                              '--format=%an <%ae>|%cn <%ce>'], text=True).strip()
+            self.assertEqual(author, 'Example Executor <2001+example-executor@users.noreply.github.com>|'
+                                     'Example Executor <2001+example-executor@users.noreply.github.com>')
+        self.assertNotEqual(first.row(1)['thread_id'], second.row(1)['thread_id'])
 
     def test_automatic_identity_and_same_account_configuration(self):
         config, state, _ = self.add_project('one', 1)

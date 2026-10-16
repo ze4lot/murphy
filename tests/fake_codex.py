@@ -42,6 +42,10 @@ if 'DESCENDANT' in prompt:
 if 'DAEMON_FOREVER' in prompt:
     subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'], start_new_session=True,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=False)
+if 'WAIT_FOR_TEST_RELEASE' in prompt:
+    Path('execution-started').write_text(str(os.getpid()))
+    while not Path('execution-release').exists():
+        time.sleep(0.05)
 if any(marker in prompt for marker in ('WRITE_TASK_FILE', 'COMMIT_TASK_FILE', 'COMMIT_EXECUTOR_FILE')):
     if 'default_permissions="murphy"' not in sys.argv or any(arg in sys.argv for arg in ('read-only', 'danger-full-access')):
         emit('error', message='Writable task permissions were not passed')
