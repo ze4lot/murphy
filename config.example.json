@@ -1,0 +1,10 @@
+{
+  "repository": "example/project",
+  "repository_id": 1001,
+  "bot_user_id": 2001,
+  "owner_user_id": 3001,
+  "owner_login": "example-owner",
+  "git": "git",
+  "gh": "gh",
+  "codex": "codex"
+}

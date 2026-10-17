@@ -1,0 +1,6 @@
+include LICENSE README.md CHANGELOG.md RELEASE.md config.example.json bridge.py
+include pyproject.toml MANIFEST.in build_backend.py
+recursive-include murphy *.py
+recursive-include tests *.py
+exclude config.local.json
+global-exclude *.pyc __pycache__ *.sqlite *.sqlite3 *.jsonl *.stderr *.local.json

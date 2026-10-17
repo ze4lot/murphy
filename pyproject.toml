@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools==75.8.2", "wheel==0.45.1"]
+build-backend = "build_backend"
+backend-path = ["."]
+
+[project]
+name = "murphy-github"
+version = "0.1.0"
+description = "A local, serial bridge from GitHub comments to persistent Codex sessions"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {file = "LICENSE"}
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+]
+dependencies = []
+
+[project.scripts]
+murphy = "murphy.cli:main"
+
+[project.urls]
+Repository = "https://github.com/ze4lot/murphy"
+Issues = "https://github.com/ze4lot/murphy/issues"
+
+[tool.setuptools]
+packages = ["murphy"]
+include-package-data = false
+
+[tool.setuptools.data-files]
+"share/murphy" = ["config.example.json"]
