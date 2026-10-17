@@ -605,7 +605,7 @@ class ManagerTests(unittest.TestCase):
         original = worker.poll
         def switch():
             self.executor['id'] = 2002
-            self.manager.last_identity_check = 0
+            self.manager.last_identity_check = float('-inf')
             original()
         worker.poll = switch
         self.tick()
@@ -725,11 +725,13 @@ class ManagerTests(unittest.TestCase):
     def test_account_change_blocks_other_projects_and_reports(self):
         _, state, _ = self.add_project('one', 1)
         self.comment('example/one', 101)
-        self.manager.pump()
-        self.user['id'] = 4001
-        self.manager.last_identity_check = 0
-        with self.assertRaisesRegex(ValueError, 'account changed'):
-            self.tick()
+        # Fresh CI machines can have less uptime than the identity interval.
+        with patch('murphy.manager.time.monotonic', return_value=0):
+            self.manager.pump()
+            self.user['id'] = 4001
+            self.manager.last_identity_check = float('-inf')
+            with self.assertRaisesRegex(ValueError, 'account changed'):
+                self.tick()
         self.assertEqual(state.row(1)['state'], 'queued')
         self.assertFalse(self.reported)
 
@@ -739,7 +741,7 @@ class ManagerTests(unittest.TestCase):
         original = worker.poll
         def switch():
             self.user['id'] = 4001
-            self.manager.last_identity_check = 0
+            self.manager.last_identity_check = float('-inf')
             original()
         worker.poll = switch
         self.tick()
@@ -761,7 +763,7 @@ class ManagerTests(unittest.TestCase):
         self.comment('example/one', 101, 'SLOW')
         original = worker.poll
         def outage():
-            self.manager.last_identity_check = 0
+            self.manager.last_identity_check = float('-inf')
             with patch.object(self.manager.account, 'verify', side_effect=RuntimeError('temporary API outage')):
                 original()
         worker.poll = outage
@@ -775,7 +777,7 @@ class ManagerTests(unittest.TestCase):
         self.comment('example/two', 102)
         self.manager.pump()
         order = self.manager.status()['commands']
-        self.manager.last_identity_check = 0
+        self.manager.last_identity_check = float('-inf')
         with patch.object(self.manager.account, 'verify', side_effect=RuntimeError('executor unavailable')) as verify:
             self.tick()
             self.tick()  # The retry interval must not reopen scheduling after a failure.
@@ -785,7 +787,7 @@ class ManagerTests(unittest.TestCase):
         self.assertFalse(list(first.directory.glob('*.jsonl')))
         self.assertFalse(list(second.directory.glob('*.jsonl')))
         self.assertFalse(self.reported)
-        self.manager.last_identity_check = 0
+        self.manager.last_identity_check = float('-inf')
         self.tick()
         self.tick()
         self.assertEqual(first.row(1)['state'], 'succeeded')
