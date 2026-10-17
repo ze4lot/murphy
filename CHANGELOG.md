@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 — experimental candidate
+## 0.1.0 — 2026-10-18 (experimental)
 
 - Installable `murphy` command and Python distribution with no runtime dependencies.
 - Setup from the signed-in GitHub account; only that immutable owner ID can issue commands. Default same-account execution or optional `init --separate-account` with one separate executor across all projects.
@@ -14,7 +14,8 @@
 - Explicit `waiting_for_user` turn outcomes free the serial queue for other issues while retaining sessions/worktrees; authenticated continuations resume the same session. Structured final results are validated on both start and resume.
 - Operational issue reports/questions are delegated to one worker publisher, preserving full PR/commit/QA details without agent labels, signatures or session metadata in comments.
 - Review fixes: reject repository Authorization headers in separate-account mode, retain queued tasks during executor-check failures, and fetch/refresh explicit task bases in single-branch checkouts.
+- Automatic OpenSSH ControlMaster sockets in a private project directory writable by the Codex sandbox, with scoped client configuration, finite idle expiry and cleanup after task descendants exit. No writable access to SSH keys or manual master preparation/closure is required.
 - Legacy explicit-JSON commands and scoped session state remain supported without implicit migration.
 - Isolated installation/archive/reproducibility checks, behavior coverage and Linux Python 3.11/3.12 CI.
 
-Limitations: experimental Linux/WSL CLI; polling order during outages is discovery order; no project removal/reconfiguration command, service, parallel execution within one project, automatic merge/deploy or published package/tag/release. Live multi-project operation still needs an authorized pilot.
+Limitations: experimental Linux/WSL CLI; polling order during outages is discovery order; no project removal/reconfiguration command, service, parallel execution within one project or automatic merge/deploy. Live multi-project operation still needs an authorized pilot. SSH connection reuse is limited to one sandbox command's lifetime. Event-driven delivery remains tracked separately in issue #4.
