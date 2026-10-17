@@ -17,6 +17,7 @@ import selectors
 import signal
 import socket
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -456,14 +457,35 @@ def worktree_changes(cwd):
     return digest.hexdigest()
 
 
+def ssh_control_directory(before):
+    # Stable across turns/restarts, separate for each source repository/installation.
+    project = hashlib.sha256(os.fsencode(before['common_dir'])).hexdigest()[:16]
+    cache = Path.home() / '.cache'
+    cache.mkdir(mode=0o700, exist_ok=True)
+    if cache.is_symlink():
+        raise ValueError('SSH socket cache must not be a symlink: ' + str(cache))
+    directory = cache
+    for part in ('murphy', project):
+        directory /= part
+        directory.mkdir(mode=0o700, exist_ok=True)
+        info = directory.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o700):
+            raise ValueError('SSH socket directory must be owned by this user, mode 0700, '
+                             'and not a symlink: ' + str(directory))
+    return directory
+
+
 def permission_args(before):
     # A linked worktree needs both its own index and the shared refs/objects writable.
     # Giving access to the whole source checkout is unnecessary.
-    metadata = sorted({before['common_dir'], before['git_dir']})
+    control_dir = str(ssh_control_directory(before))
+    metadata = sorted({before['common_dir'], before['git_dir'], control_dir})
     filesystem = ', '.join(json.dumps(path) + ' = "write"' for path in metadata)
     profile = '{ extends = ":workspace", filesystem = { ' + filesystem + ' }, network = { enabled = true } }'
     return ['--config', 'default_permissions="murphy"',
             '--config', 'permissions.murphy=' + profile,
+            '--config', 'shell_environment_policy.set.MURPHY_SSH_CONTROL_DIR=' + json.dumps(control_dir),
             '--config', 'approval_policy="never"']
 
 
@@ -761,6 +783,7 @@ class Worker:
             self.state.finish(row['id'], 'unknown', f'Execution outcome uncertain: {error}')
 
     def run_codex(self, row, task, before, fd):
+        control_dir = ssh_control_directory(before)
         schema_path = self.state.directory / 'turn-result.schema.json'
         schema_path.write_text(json.dumps(TURN_SCHEMA))
         args = [self.codex, 'exec', '--ignore-user-config', '--json'] + permission_args(before)
@@ -778,6 +801,11 @@ class Worker:
                   'change authentication or touch other projects unless the owner explicitly requested that scope. '
                   'Do not leave background processes running. Earlier bridge-added read-only pilot restrictions are retired; '
                   'honor any explicit read-only instructions from the owner.\n\n'
+                  'OpenSSH ControlMaster sockets may use ${MURPHY_SSH_CONTROL_DIR}/%C; this private project directory '
+                  'is writable in the sandbox. Use ControlMaster auto and a finite ControlPersist (for example 60), '
+                  'with the existing authorized host/user and host-key checking. Do not start a manual SSH master '
+                  'or use an indefinite ControlPersist. OpenSSH manages socket creation and idle cleanup; '
+                  'the worker also drains descendants before releasing the task slot.\n\n'
                   'For this Murphy invocation, the worker is the sole publisher of operational comments to the triggering issue. '
                   'Do not post progress, completion reports, blockers or questions yourself through gh or another API. '
                   'If AGENTS.md or a repository skill requires an issue report, fulfil that requirement by returning '
@@ -888,6 +916,11 @@ class Worker:
                     child.poll()
                     time.sleep(0.05)
                 child.wait()
+                # Native sandbox teardown can kill an idle master before OpenSSH
+                # unlinks its listener. All task descendants are gone at this point.
+                for path in control_dir.iterdir():
+                    if stat.S_ISSOCK(path.lstat().st_mode):
+                        path.unlink()
         turn_id = rollout_turn(task, thread, self.state.row(row['id'])['started'], now())
         if turn_id:
             with self.state.db:

@@ -235,6 +235,26 @@ Do not edit SQLite files while Murphy runs. Do not delete state to recover an un
 
 Codex gets a named permission profile extending `:workspace`: the assigned task worktree and its Git metadata are writable, network is enabled, interactive approvals are disabled. Shared Git refs/objects need explicit access for linked worktrees; sibling source working files are not granted. Both start/resume receive the same permission settings; there is no full-access fallback. The child uses the existing Codex login without copying auth files, removes inherited OpenAI API-key variables and ignores unrelated Codex user configuration. Task instructions and target `AGENTS.md` still define authorized scope.
 
+### OpenSSH connection sharing in the sandbox
+
+Murphy automatically creates a private `0700` socket directory under `~/.cache/murphy/<project-hash>` and adds **only that directory** to the Codex profile's writable paths on both start and resume. `MURPHY_SSH_CONTROL_DIR` is set explicitly in the Codex shell environment. The hash identifies the source Git directory: linked task worktrees share a project directory; separate repositories/installations have different paths. The Linux home and ownership checks separate local users. Existing symlinks, foreign ownership or permissions other than `0700` in Murphy's socket directories stop execution; Murphy never fixes their permissions silently. No write access to `~/.ssh`, private keys or other projects' socket directories is added. These are write boundaries, not a new read/credential isolation mechanism; existing Codex read access and authentication remain as before.
+
+One-time operator setup, after installing this version: add the following to the **client** SSH configuration used by the authorized destination. Replace `deploy.example.invalid` with the exact destination or alias used by SSH/SCP. Put the block **before** existing `Host` defaults for `ControlPath`, `ControlMaster` or `ControlPersist` (OpenSSH uses the first matching value). Keep existing identity settings and trusted host keys.
+
+```sshconfig
+Match originalhost deploy.example.invalid exec "test x${MURPHY_SSH_CONTROL_DIR:+set} = xset"
+    ControlMaster auto
+    ControlPersist 60
+    ControlPath ${MURPHY_SSH_CONTROL_DIR}/%C
+Match all
+```
+
+The `Match` condition leaves ordinary SSH outside Murphy using its existing configuration. `%C` separates destination host, port and remote user. Keep host-key checking enabled and provision trusted host keys once through the operator's normal process; do not disable checking to avoid sandbox writes. If a release command supplies `-F`, install the block in that file; an explicit `-S`/`-o ControlPath` overrides the file and must be adjusted once to use the same directory. Like any OpenSSH Unix socket path, the expanded path must fit the platform's length limit; unusually long home paths may exceed it.
+
+The first ordinary SSH command creates its master automatically; subsequent SSH/SCP clients in the same sandbox command (for example, one release script or `make` invocation) reuse it. OpenSSH's finite `ControlPersist` closes idle masters and removes their sockets. A sandbox namespace can terminate its background master when the command exits, so reuse is not guaranteed across separate Codex tool commands. After all task descendants have exited, Murphy removes remaining socket files in this project's dedicated directory; other files and symlinks are preserved. Existing cancellation/timeout draining remains in force. No SSH transport, master launcher or connection registry is added.
+
+Every task recreates a missing directory, and its path is stable across Murphy/WSL restarts. OpenSSH automatically replaces a dead control socket on its next connection after an unclean stop. Normal queue reconciliation still applies to interrupted tasks; this change does not replay uncertain commands. No `ssh -MNf`, `ssh -O exit`, per-release operator action, server/firewall change or production change is required.
+
 ### Prototype compatibility
 
 The original explicit-JSON, single-project interface remains available via `python3 bridge.py --config PATH ...` from source, or `murphy --config PATH ...` after installation. `config.example.json` contains fictional values only; it is shipped in source and installed under the environment's `share/murphy/`. Fields: `repository`, `repository_id`, `bot_user_id` (publishing account), `owner_user_id`, `owner_login`, and optional `git`, `gh`, `codex` executables. Publishing and owner IDs may now match. Separate legacy bot accounts remain supported.
@@ -262,6 +282,14 @@ python3 tests/check_sandbox.py --codex codex --separate-account
 ```
 
 The separate-account sandbox check uses fictional GitHub CLI credentials to exercise real worktree editing/committing, scoped Git credential retrieval and GitHub identity reads inside the native sandbox. It makes no model calls or real GitHub requests.
+
+Optional local OpenSSH check (requires an available OpenSSH server executable for the disposable fixture, never a production server):
+
+```bash
+python3 tests/check_ssh.py --codex codex --sshd /usr/sbin/sshd
+```
+
+This starts an unprivileged server bound only to `127.0.0.1` with fresh test keys and pinned host keys. Two real Murphy worker processes run start/resume with a CLI double replacing model output; commands run under the native Codex sandbox using the worker's actual permission arguments. It checks cold master creation, SSH and bidirectional SCP reuse with subsequent client authentication disabled, one authenticated connection per turn, idle expiry, worker cleanup, dead-socket recovery, missing-directory recreation, host/user/port scoping, strict host-key rejection and write protection for fixture keys, configuration, sibling source files and another project's socket directory. It makes no model calls or external SSH/GitHub requests and does not reboot WSL. The server executable is a test prerequisite, not a Murphy runtime dependency. Native option references: [Codex permission profiles](https://learn.chatgpt.com/docs/permissions), [OpenSSH client configuration](https://man.openbsd.org/ssh_config).
 
 A controlled live pilot requires explicit authorization: use disposable repositories with your own credentials, a separate state directory and the intended base. For separate-account qualification, also use an authorized second account: verify only owner comments trigger work, reports/PRs/pushes belong to the executor, commit attribution matches, and normal human Git/GitHub settings remain unchanged. Start with the inspection-only example; verify the report and session, then authorize a small edit/test/commit/PR task and a continuation. Confirm a stable UUID per continued task, isolated worktrees, the configured concurrency bound, per-project order and stop/recovery behavior. Exercise the serial override for projects with shared infrastructure. Do not publish, merge or deploy as part of this pilot. This release preparation does not claim a live multi-project/two-account pilot was performed.
 
