@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 import unittest
 from unittest.mock import patch
 
@@ -60,6 +61,9 @@ class BridgeTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         root = Path(self.temp.name)
+        home = patch.dict(os.environ, HOME=str(root))
+        home.start()
+        self.addCleanup(home.stop)
         self.config_path = root / 'config.json'
         self.config_path.write_text(json.dumps(FIXTURE_CONFIG))
         b.configure(self.config_path)
@@ -494,12 +498,70 @@ class BridgeTests(unittest.TestCase):
             self.assertIn('extends = ":workspace"', profile)
             self.assertIn('network = { enabled = true }', profile)
             self.assertIn(str(self.cwd / '.git'), profile)
+            config = tomllib.loads(profile)
+            control_dir = b.ssh_control_directory(b.checkout(str(self.cwd)))
+            self.assertEqual(config['permissions']['murphy']['filesystem'][str(control_dir)], 'write')
+            self.assertEqual(control_dir.stat().st_mode & 0o777, 0o700)
+            self.assertIn('shell_environment_policy.set.MURPHY_SSH_CONTROL_DIR=' + json.dumps(str(control_dir)), args)
+            self.assertNotIn(str(Path.home() / '.ssh'), config['permissions']['murphy']['filesystem'])
             self.assertIn('commit, push the task branch', event['prompt'])
             self.assertIn('Configured GitHub CLI executable:', event['prompt'])
             self.assertIn('--output-schema', args)
             schema = json.loads(Path(args[args.index('--output-schema') + 1]).read_text())
             self.assertEqual(schema, b.TURN_SCHEMA)
             self.assertIn('waiting_for_user', event['prompt'])
+
+    def test_ssh_socket_directory_survives_restart_and_is_scoped_to_source(self):
+        before = b.checkout(str(self.cwd))
+        directory = b.ssh_control_directory(before)
+        # A fresh worker/process reconstructs the same path; linked worktrees share it.
+        code = ('import json,sys; from murphy.bridge import ssh_control_directory; '
+                'print(ssh_control_directory(json.loads(sys.argv[1])))')
+        restarted = subprocess.check_output([sys.executable, '-c', code, json.dumps(before)], text=True).strip()
+        self.assertEqual(restarted, str(directory))
+        self.assertEqual(b.ssh_control_directory(dict(before, git_dir='/other/worktree/git')), directory)
+        other = b.ssh_control_directory(dict(before, common_dir=str(self.cwd / 'other.git')))
+        self.assertNotEqual(other, directory)
+        profile = tomllib.loads(b.permission_args(before)[3])['permissions']['murphy']['filesystem']
+        self.assertNotIn(str(other), profile)
+        self.assertNotIn(str(directory.parent), profile)
+        directory.rmdir()  # Missing cache directories are recreated, including after host restart.
+        self.assertEqual(b.ssh_control_directory(before), directory)
+
+    def test_ssh_socket_directory_refuses_symlinks_and_unsafe_permissions(self):
+        before = b.checkout(str(self.cwd))
+        directory = b.ssh_control_directory(before)
+        directory.chmod(0o755)
+        with self.assertRaisesRegex(ValueError, 'mode 0700'):
+            b.permission_args(before)
+        self.assertEqual(directory.stat().st_mode & 0o777, 0o755)
+        directory.rmdir()
+        target = self.cwd / 'preserve'
+        target.mkdir()
+        directory.symlink_to(target, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, 'not a symlink'):
+            b.permission_args(before)
+        self.assertTrue(directory.is_symlink())
+        self.assertEqual(list(target.iterdir()), [])
+        directory.unlink()
+        directory.parent.chmod(0o777)
+        with self.assertRaisesRegex(ValueError, 'mode 0700'):
+            b.permission_args(before)
+
+    def test_ssh_socket_cleanup_after_success_and_timeout_preserves_other_files(self):
+        directory = b.ssh_control_directory(b.checkout(str(self.cwd)))
+        (directory / 'preserve').write_text('keep')
+        (directory / 'link').symlink_to(directory / 'preserve')
+        for verb, prompt, expected in (('start', 'LEAVE_SSH_SOCKET', 'succeeded'),
+                                       ('continue', 'LEAVE_SSH_SOCKET DAEMON_FOREVER', 'unknown')):
+            self.worker.timeout = 0.3
+            ident = self.state.enqueue('a', verb, prompt)
+            self.execute()
+            self.assertEqual(self.state.row(ident)['state'], expected)
+            self.assertFalse((directory / 'test-socket').exists())
+            self.assertEqual((directory / 'preserve').read_text(), 'keep')
+            self.assertTrue((directory / 'link').is_symlink())
+            self.assertEqual(b.descendants(), {})
 
     def test_timeout_kills_detached_child_before_slot_is_released(self):
         self.worker.timeout = 0.3

@@ -57,6 +57,7 @@ def main():
                                           gh_config_dir=str(directory), git_name='Example Executor',
                                           git_email='2001+example-executor@users.noreply.github.com')
         before = bridge.checkout(str(task))
+        control_dir = bridge.ssh_control_directory(before)
         server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -97,6 +98,7 @@ print('PASS: worktree edit, commit, network access, sibling checkout protection'
             server.shutdown()
             server.server_close()
             thread.join()
+            control_dir.rmdir()
 
 
 if __name__ == '__main__':

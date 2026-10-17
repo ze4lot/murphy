@@ -16,6 +16,13 @@ def emit(kind, **data):
 
 emit('thread.started', thread_id=thread, argv=sys.argv, prompt=prompt)
 emit('turn.started', turn_id=str(uuid.uuid4()))
+if 'LEAVE_SSH_SOCKET' in prompt:
+    import socket
+    import tomllib
+    value = next(arg for arg in sys.argv if arg.startswith('shell_environment_policy.set.MURPHY_SSH_CONTROL_DIR='))
+    directory = tomllib.loads(value)['shell_environment_policy']['set']['MURPHY_SSH_CONTROL_DIR']
+    with socket.socket(socket.AF_UNIX) as listener:
+        listener.bind(str(Path(directory) / 'test-socket'))
 schema = json.loads(Path(sys.argv[sys.argv.index('--output-schema') + 1]).read_text())
 assert set(schema['properties']['outcome']['enum']) == {'succeeded', 'waiting_for_user'}
 if 'ASSERT_EXECUTOR_ENV' in prompt:
