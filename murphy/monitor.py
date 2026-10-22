@@ -20,6 +20,34 @@ LABELS = {'queued': 'W KOLEJCE', 'running': 'PRACUJE', 'waiting_for_user': 'CZEK
           'succeeded': 'ZAKOŃCZONE', 'failed': 'BŁĄD', 'blocked': 'ZABLOKOWANE',
           'cancelled': 'ANULOWANE', 'unknown': 'WYNIK NIEZNANY'}
 PENDING = ('queued', 'running', 'waiting_for_user', 'blocked', 'unknown')
+ALWAYS_VISIBLE = ('queued', 'running', 'blocked', 'unknown')
+
+
+def task_commands(connection):
+    """Latest turn per session, plus every queued, active or unsafe command."""
+    return connection.execute('''WITH latest AS (
+        SELECT MAX(c.id) AS id FROM commands c LEFT JOIN items b ON b.number=c.item
+        WHERE c.verb IN ('start','continue')
+        GROUP BY CASE WHEN COALESCE(c.task,b.task) IS NOT NULL THEN 'task:' || COALESCE(c.task,b.task)
+                      WHEN c.item IS NOT NULL THEN 'issue:' || c.item
+                      ELSE 'command:' || c.id END
+    ) SELECT c.id,c.item,c.task,c.state,c.started,c.finished,c.detail,c.execution_id,t.issue_json
+        FROM commands c LEFT JOIN items b ON b.number=c.item
+        LEFT JOIN tasks t ON t.name=COALESCE(c.task,b.task)
+        WHERE c.verb IN ('start','continue') AND
+        (c.id IN (SELECT id FROM latest) OR c.state IN ('queued','running','blocked','unknown'))
+        ORDER BY c.id''').fetchall()
+
+
+def issue_cache(value):
+    try:
+        cache = json.loads(value or '{}')
+        return {key: item for key, item in cache.items()
+                if isinstance(item, dict) and item.get('state') in ('OPEN', 'CLOSED', 'MERGED', 'UNKNOWN')
+                and isinstance(item.get('title', ''), str)
+                and isinstance(item.get('checked'), (int, float))}
+    except (ValueError, AttributeError, TypeError):
+        return {}
 
 
 def state_directory(directory=None):
@@ -104,23 +132,25 @@ def snapshot(directory=None):
         paused = manager.execute("SELECT value FROM settings WHERE key='paused'").fetchone()
         projects = manager.execute('SELECT id,repository FROM projects ORDER BY id').fetchall()
         tickets = {(row['project'], row['command']): row['id'] for row in manager.execute('SELECT * FROM queue')}
-    commands = []
+    commands, hidden_closed = [], 0
     for project in projects:
         project_dir = directory / 'projects' / str(project['id'])
         with database(project_dir / 'state.sqlite') as state:
-            rows = state.execute('''SELECT c.id,c.item,c.task,c.state,c.started,c.finished,c.detail,
-                c.execution_id,t.issue_json FROM commands c LEFT JOIN tasks t ON t.name=c.task
-                WHERE c.verb IN ('start','continue') AND (c.state IN (?,?,?,?,?) OR c.id IN (
-                    SELECT id FROM commands WHERE verb IN ('start','continue')
-                    AND state NOT IN (?,?,?,?,?) ORDER BY finished DESC,id DESC LIMIT 5))''', PENDING * 2)
-            for row in rows:
+            saved = state.execute("SELECT value FROM settings WHERE key='monitor_issues'").fetchone()
+            cache = issue_cache(saved[0] if saved else None)
+            for row in task_commands(state):
                 ident = tickets.get((project['id'], row['id']))
                 if ident is None:  # Enrollment belongs to the coordinator, including after a crash.
+                    continue
+                issue = cache.get(str(row['item']), {})
+                if issue.get('state') in ('CLOSED', 'MERGED') and row['state'] not in ALWAYS_VISIBLE:
+                    hidden_closed += 1
                     continue
                 title = ''
                 if row['issue_json']:
                     with contextlib.suppress(ValueError, AttributeError):
                         title = json.loads(row['issue_json']).get('title', '')
+                title = issue.get('title') or title
                 task = f'#{row["item"]}' if row['item'] else row['task'] or 'Zadanie lokalne'
                 commands.append({'id': ident, 'repository': project['repository'],
                                  'task': task + (' ' + title if title else ''),
@@ -133,7 +163,7 @@ def snapshot(directory=None):
     recent = sorted((row for row in commands if row['state'] not in PENDING),
                     key=lambda row: (row['finished'] or '', row['id']), reverse=True)[:5]
     return {'worker': read_worker(directory), 'paused': bool(paused and paused[0] == '1'),
-            'commands': pending + recent, 'observed': time.time()}
+            'commands': pending + recent, 'observed': time.time(), 'hidden_closed': hidden_closed}
 
 
 def clean(value):
@@ -142,14 +172,20 @@ def clean(value):
 
 def fit(value, width):
     text = clean(value)
-    result, used = '', 0
+    result, sizes, used = [], [], 0
     for char in text:
         size = 0 if unicodedata.combining(char) else 2 if unicodedata.east_asian_width(char) in ('W', 'F') else 1
         if used + size > width:
-            return fit(result, max(0, width - 1)).rstrip() + '…' if width else ''
-        result += char
+            if not width:
+                return ''
+            while result and used > width - 1:
+                result.pop()
+                used -= sizes.pop()
+            return ''.join(result) + '…' + ' ' * (width - used - 1)
+        result.append(char)
+        sizes.append(size)
         used += size
-    return result + ' ' * (width - used)
+    return ''.join(result) + ' ' * (width - used)
 
 
 def duration(started, finished, observed):
@@ -163,6 +199,8 @@ def duration(started, finished, observed):
 
 
 def render(data, width=100, height=24, footer='Ctrl+C — zamknij podgląd'):
+    if width < 1 or height < 1:
+        return ''
     worker, rows, observed = data['worker'], data['commands'], data['observed']
     active = sum(row['state'] == 'running' for row in rows) if worker else 0
     queued = sum(row['state'] == 'queued' for row in rows)
@@ -171,12 +209,25 @@ def render(data, width=100, height=24, footer='Ctrl+C — zamknij podgląd'):
     slots = f'/{worker["parallel"]}' if worker else ''
     lines = [f'Murphy · {state} · aktywne: {active}{slots} · w kolejce: {queued}',
              'Odświeżono: ' + dt.datetime.fromtimestamp(observed).strftime('%H:%M:%S'), '']
-    wide = width >= 80
-    task_width = max(10, width - 57)
-    if wide:
-        lines.append(f'{"ID":<6} {"REPO":<22} {fit("ZADANIE", task_width)} {"STATUS":<17} CZAS')
+    bottom = []
+    if data.get('hidden_closed'):
+        bottom.append(f'Ukryto zamknięte w GitHub: {data["hidden_closed"]}')
+    if data.get('diagnostic'):
+        bottom.append('Worker: ' + data['diagnostic'])
+    bottom.extend(['', footer])
+    id_width = max(2, max((len(str(row['id'])) for row in rows), default=2))
+    repo_width = min(28, max(10, max((len(row['repository']) for row in rows), default=10)), max(10, width // 4))
+    status_width = max(6, max((len(LABELS.get(row['state'], row['state'])) for row in rows), default=6))
+    status_width = max(status_width, len('BRAK WORKERA') if not worker and any(row['state'] == 'running' for row in rows) else 0)
+    time_width = max(4, max((len(duration(row['started'], row['finished'], observed)) for row in rows), default=4))
+    task_width = width - id_width - repo_width - status_width - time_width - 12
+    wide = task_width >= 16
+    widths = (id_width, repo_width, task_width, status_width, time_width)
+    if wide and rows:
+        lines.append(' │ '.join(fit(value, size) for value, size in zip(('ID', 'REPO', 'ZADANIE', 'STATUS', 'CZAS'), widths)))
+        lines.append('─┼─'.join('─' * size for size in widths))
     for index, row in enumerate(rows):
-        if len(lines) >= height - 4:
+        if len(lines) + (1 if wide else 2) > height - len(bottom) - 1:
             lines.append(f'… pozostałe zadania: {len(rows) - index}')
             break
         status = LABELS.get(row['state'], row['state'])
@@ -184,21 +235,21 @@ def render(data, width=100, height=24, footer='Ctrl+C — zamknij podgląd'):
         if row['state'] == 'running' and not worker:
             status, elapsed = 'BRAK WORKERA', '—'
         if wide:
-            lines.append(f'{row["id"]:<6} {fit(row["repository"], 22)} {fit(row["task"], task_width)} {status:<17} {elapsed}')
+            values = (row['id'], row['repository'], row['task'], status, elapsed)
+            lines.append(' │ '.join(fit(value, size) for value, size in zip(values, widths)))
         else:
-            lines.extend([f'{row["id"]} · {row["repository"]} · {status} · {elapsed}', '  ' + row['task']])
-        if row['activity'] and len(lines) < height - 3:
+            lines.extend([f'{row["id"]} · {status} · {elapsed}', f'  {row["repository"]} · {row["task"]}'])
+        if row['activity'] and len(lines) < height - len(bottom) - 1:
             event = row['activity']
             age = f'{max(0, int(observed - event["updated"]))} s temu' if event['updated'] else 'brak zapisów'
             lines.append(f'  Log: {age}' + (' · ' + event['text'] if event['text'] else ''))
-        elif row['state'] in ('waiting_for_user', 'blocked', 'unknown', 'failed') and row['detail'] and len(lines) < height - 3:
-            lines.append('  ' + row['detail'])
+        elif row['state'] in ('waiting_for_user', 'blocked', 'unknown', 'failed') and row['detail'] and len(lines) < height - len(bottom) - 1:
+            summary = next((line.strip() for line in row['detail'].splitlines() if line.strip()), '')
+            lines.append('  ' + summary)
     if not rows:
         lines.append('Brak zadań. Oczekiwanie na polecenia.' if worker else 'Brak zadań. Worker nie jest uruchomiony.')
-    if data.get('diagnostic'):
-        lines.append('Worker: ' + data['diagnostic'])
-    lines.extend(['', footer])
-    return '\n'.join(fit(line, width).rstrip() for line in lines[:height])
+    lines = lines[:max(0, height - len(bottom))] + bottom
+    return '\n'.join(fit(line, width).rstrip() for line in lines[-height:])
 
 
 class Terminal:
@@ -218,7 +269,7 @@ class Terminal:
         text = render(data, size.columns, max(1, size.lines - 1), self.footer)
         # Pipes get state changes, without ANSI escapes or a new timer line every second.
         signature = [(row['id'], row['state'], row['activity']) for row in data['commands']]
-        signature = (data['worker'], data['paused'], signature, data.get('diagnostic'), data.get('phase'))
+        signature = (data['worker'], data['paused'], signature, data.get('diagnostic'), data.get('phase'), data.get('hidden_closed'))
         if self.tty or signature != self.previous:
             print(('\x1b[H\x1b[2J' if self.tty else '') + text, flush=True)
         self.previous, self.last = signature, data

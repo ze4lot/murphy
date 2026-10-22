@@ -147,7 +147,7 @@ def command(body):
 
 
 class GitHub:
-    def api(self, path, method='GET', payload=None, pages=False, missing_ok=False):
+    def api(self, path, method='GET', payload=None, pages=False, missing_ok=False, partial_graphql=False):
         args = [CONFIG.gh, 'api', '--hostname', 'github.com', '--method', method, path]
         if pages:
             args += ['--paginate', '--slurp']
@@ -159,6 +159,15 @@ class GitHub:
         if result.returncode:
             if missing_ok and '(HTTP 404)' in result.stderr:
                 return None
+            if partial_graphql and path == 'graphql':
+                # gh exits nonzero for partial GraphQL responses too. Only the
+                # opt-in status reader may inspect these; ordinary calls still fail.
+                try:
+                    partial = json.loads(result.stdout)
+                    if isinstance(partial, dict) and partial.get('data') and partial.get('errors'):
+                        return partial
+                except ValueError:
+                    pass
             raise RuntimeError(f'GitHub {method} {path}: {result.stderr.strip()[:400]}')
         value = json.loads(result.stdout)
         return [item for page in value for item in page] if pages else value
@@ -190,6 +199,42 @@ class GitHub:
         if 'pull_request' in issue or issue.get('state') != 'open':
             raise ValueError('Automatic start requires an open issue, not a PR')
         return {key: issue[key] for key in ('number', 'title', 'body', 'updated_at')}
+
+    def issue_states(self, numbers):
+        """One bounded read for tracked issues/PRs, including already closed items."""
+        if not 1 <= len(numbers) <= 50 or any(type(number) is not int or number < 1 for number in numbers):
+            raise ValueError('Expected between 1 and 50 positive issue/PR numbers')
+        fields = ' '.join(f'i{number}: issueOrPullRequest(number: {number}) {{ ...status }}' for number in numbers)
+        query = '''query MonitorIssueStates($owner: String!, $repo: String!) {
+          repository(owner: $owner, name: $repo) { databaseId ''' + fields + ''' }
+        }
+        fragment status on IssueOrPullRequest {
+          ... on Issue { number state title }
+          ... on PullRequest { number state title }
+        }'''
+        owner, repo = CONFIG.repository.split('/')
+        result = self.api('graphql', 'POST', {'query': query, 'variables': {'owner': owner, 'repo': repo}}, partial_graphql=True)
+        if not isinstance(result, dict) or not isinstance(result.get('data'), dict):
+            raise RuntimeError('Invalid issue status response; cached states retained')
+        repository = (result.get('data') or {}).get('repository')
+        missing_paths = [['repository', f'i{number}'] for number in numbers]
+        errors = result.get('errors') or []
+        if not isinstance(errors, list):
+            raise RuntimeError('Invalid issue status errors; cached states retained')
+        errors_ok = all(isinstance(error, dict) and error.get('type') == 'NOT_FOUND' and error.get('path') in missing_paths
+                        for error in errors)
+        if not errors_ok or not isinstance(repository, dict) or repository.get('databaseId') != CONFIG.repository_id:
+            raise RuntimeError('Issue status lookup failed or repository identity changed; cached states retained')
+        states = {}
+        for number in numbers:
+            item = repository.get(f'i{number}')
+            if item is None:  # Deleted/inaccessible is not evidence of closure.
+                continue
+            if (not isinstance(item, dict) or item.get('number') != number
+                    or item.get('state') not in ('OPEN', 'CLOSED', 'MERGED') or not isinstance(item.get('title'), str)):
+                raise RuntimeError('Unexpected issue status response; cached states retained')
+            states[str(number)] = {'state': item['state'], 'title': item.get('title', '')}
+        return states
 
     def start_base(self, number, default):
         parent = self.api(f'repos/{CONFIG.repository}/issues/{number}/parent', missing_ok=True)

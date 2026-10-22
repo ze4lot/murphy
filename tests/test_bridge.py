@@ -60,6 +60,69 @@ class Api:
         return 1000 + row['id']
 
 
+class IssueStateTests(unittest.TestCase):
+    def setUp(self):
+        previous = b.CONFIG
+        b.CONFIG = b.Config(**FIXTURE_CONFIG)
+        self.addCleanup(setattr, b, 'CONFIG', previous)
+
+    def response(self):
+        return {'data': {'repository': {'databaseId': 1001,
+            'i7': {'number': 7, 'state': 'CLOSED', 'title': 'Closed task'},
+            'i8': {'number': 8, 'state': 'MERGED', 'title': 'Merged PR'}}}}
+
+    def test_statuses_are_one_read_including_closed_issues_and_merged_prs(self):
+        with patch.object(b.GitHub, 'api', return_value=self.response()) as api:
+            states = b.GitHub().issue_states([7, 8])
+        self.assertEqual(states['7']['state'], 'CLOSED')
+        self.assertEqual(states['8']['state'], 'MERGED')
+        api.assert_called_once()
+        self.assertTrue(api.call_args.kwargs['partial_graphql'])
+        self.assertIn('i7: issueOrPullRequest(number: 7)', api.call_args.args[2]['query'])
+        self.assertEqual(api.call_args.args[2]['variables'], {'owner': 'example', 'repo': 'project'})
+
+    def test_missing_item_does_not_discard_other_statuses(self):
+        response = self.response()
+        response['data']['repository']['i7'] = None
+        response['errors'] = [{'type': 'NOT_FOUND', 'path': ['repository', 'i7']}]
+        with patch.object(b.GitHub, 'api', return_value=response):
+            self.assertEqual(b.GitHub().issue_states([7, 8]), {'8': {'state': 'MERGED', 'title': 'Merged PR'}})
+
+    def test_status_reader_rejects_wrong_identity_errors_and_malformed_data(self):
+        for change in ('repository', 'number', 'state', 'permission', 'root', 'title'):
+            response = self.response()
+            if change == 'repository':
+                response['data']['repository']['databaseId'] = 2002
+            elif change == 'number':
+                response['data']['repository']['i7']['number'] = 99
+            elif change == 'state':
+                response['data']['repository']['i7']['state'] = 'UNEXPECTED'
+            elif change == 'permission':
+                response['errors'] = [{'type': 'FORBIDDEN', 'path': ['repository', 'i7']}]
+            elif change == 'title':
+                response['data']['repository']['i7']['title'] = None
+            else:
+                response = {'data': None}
+            with self.subTest(change=change), patch.object(b.GitHub, 'api', return_value=response), self.assertRaises(RuntimeError):
+                b.GitHub().issue_states([7, 8])
+
+    def test_graphql_partial_response_requires_explicit_opt_in(self):
+        response = self.response()
+        response['data']['repository']['i7'] = None
+        response['errors'] = [{'type': 'NOT_FOUND', 'path': ['repository', 'i7']}]
+        result = subprocess.CompletedProcess([], 1, json.dumps(response), 'One item was not found')
+        with patch.object(b.subprocess, 'run', return_value=result):
+            self.assertEqual(b.GitHub().issue_states([7, 8])['8']['state'], 'MERGED')
+            with self.assertRaises(RuntimeError):
+                b.GitHub().api('graphql', 'POST', {'query': 'ordinary call'})
+
+    def test_status_lookup_is_bounded_before_any_request(self):
+        for numbers in ([], list(range(1, 52)), [-1], ['7']):
+            with self.subTest(numbers=numbers), patch.object(b.GitHub, 'api') as api, self.assertRaises(ValueError):
+                b.GitHub().issue_states(numbers)
+            api.assert_not_called()
+
+
 class ProjectStatusTests(unittest.TestCase):
     def item(self, ident='item-1', status='todo', **changes):
         item = {'id': ident, 'isArchived': False,

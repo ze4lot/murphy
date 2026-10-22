@@ -16,7 +16,7 @@ import time
 
 from . import bridge as b
 from . import auth
-from .monitor import worker_record
+from .monitor import ALWAYS_VISIBLE, issue_cache, task_commands, worker_record
 
 
 @contextlib.contextmanager
@@ -162,6 +162,7 @@ class Manager:
         self.max_parallel_projects = 2
         self.active = {}  # project ID -> (executor process, project command ID)
         self.owner_pid = os.getpid()
+        self.last_issue_check = {}
 
     def close(self):
         if os.getpid() == self.owner_pid and self.active:
@@ -434,6 +435,38 @@ class Manager:
             with project_config(config):
                 worker.reports()
 
+    def refresh_issue_states(self):
+        """Optional monitor metadata: at most one batch per project every five minutes."""
+        clock, checked = time.monotonic(), time.time()
+        for project, (config, state, worker) in self.projects.items():
+            if clock - self.last_issue_check.get(project, float('-inf')) < 300:
+                continue
+            self.last_issue_check[project] = clock  # Failures back off too.
+            cache = issue_cache(state.setting('monitor_issues'))
+            numbers = set()
+            for row in task_commands(state.db):
+                if not row['item'] or row['state'] in ALWAYS_VISIBLE:
+                    continue
+                saved = cache.get(str(row['item']), {})
+                ttl = 3600 if saved.get('state') in ('CLOSED', 'MERGED') else 300
+                if checked - saved.get('attempted', saved.get('checked', 0)) >= ttl:
+                    numbers.add(row['item'])
+            numbers = sorted(numbers, key=lambda number: (cache.get(str(number), {}).get('attempted', 0), number))[:50]
+            if not numbers:
+                continue
+            try:
+                with project_config(config):
+                    updates = worker.github.issue_states(numbers)
+            except (RuntimeError, OSError, subprocess.SubprocessError, json.JSONDecodeError) as error:
+                print(f'Issue status refresh deferred; cached states retained: {error}', file=sys.stderr)
+                continue
+            for number in numbers:
+                key = str(number)
+                saved = cache.get(key, {'state': 'UNKNOWN', 'checked': 0})
+                cache[key] = dict(updates[key], checked=checked, attempted=checked) if key in updates else dict(saved, attempted=checked)
+            with state.db:
+                state.set('monitor_issues', json.dumps(cache))
+
     def drain_orphans(self):
         # A dead executor's detached children are adopted by this subreaper.
         # Never inspect/signal descendants of an executor that is still alive.
@@ -573,6 +606,8 @@ class Manager:
             try:
                 while not self.stop:
                     self.tick(fd, background=not once)
+                    if not self.stop and self.account_ready:
+                        self.refresh_issue_states()
                     if once:
                         self.reports()
                         break
