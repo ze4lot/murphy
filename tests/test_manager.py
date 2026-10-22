@@ -45,8 +45,8 @@ class ManagerTests(unittest.TestCase):
         self.addCleanup(account_api.stop)
         test = self
         class Api:
-            def api(self, path, method='GET', payload=None, pages=False, missing_ok=False):
-                return test.github_api(path, method, payload, pages, missing_ok)
+            def api(self, path, method='GET', payload=None, pages=False, missing_ok=False, partial_graphql=False):
+                return test.github_api(path, method, payload, pages, missing_ok, partial_graphql)
         api = patch.object(b.GitHub, 'api', Api.api)
         api.start()
         self.addCleanup(api.stop)
@@ -71,10 +71,16 @@ class ManagerTests(unittest.TestCase):
             return self.repos[path[6:]]
         raise AssertionError(path)
 
-    def github_api(self, path, method='GET', payload=None, pages=False, missing_ok=False):
+    def github_api(self, path, method='GET', payload=None, pages=False, missing_ok=False, partial_graphql=False):
         repository = b.CONFIG.repository
         self.assertIn(repository, self.repos)
         if path == 'graphql':
+            if 'MonitorIssueStates' in payload['query']:
+                numbers = b.re.findall(r'i([0-9]+): issueOrPullRequest', payload['query'])
+                states = getattr(self, 'item_states', {})
+                return {'data': {'repository': dict(databaseId=b.CONFIG.repository_id, **{
+                    'i' + number: {'number': int(number), 'state': states.get(int(number), 'OPEN'), 'title': 'Task'}
+                    for number in numbers})}}
             return {'data': {'repository': {'issueOrPullRequest': {'projectItems': {
                 'nodes': [], 'pageInfo': {'hasNextPage': False, 'endCursor': None}}}}}}
         if path == 'user':
@@ -510,11 +516,11 @@ class ManagerTests(unittest.TestCase):
     def test_monitor_uses_global_ids_excludes_controls_and_limits_history(self):
         _, first, _ = self.add_project('one', 1)
         _, second, _ = self.add_project('two', 2)
-        for _ in range(7):
-            ident = first.enqueue(None, 'start', 'Old work', item=7)
+        for number in range(1, 8):
+            ident = first.enqueue(None, 'start', 'Old work', item=number)
             first.finish(ident, 'succeeded', 'Done')
         first.enqueue(None, 'pause', '')
-        first.enqueue(None, 'continue', 'Queued', item=7)
+        first.enqueue(None, 'continue', 'Queued', item=20)
         second.enqueue(None, 'start', 'Needs reconciliation', item=8)
         second.finish(1, 'unknown', 'Inspect saved work')
         self.manager.sync_queue()
@@ -545,6 +551,148 @@ class ManagerTests(unittest.TestCase):
         text = monitor.render(data)
         self.assertIn('BRAK WORKERA', text)
         self.assertNotIn('· aktywne: 1', text)
+
+    def test_monitor_collapses_old_turns_but_preserves_active_and_unsafe_commands(self):
+        _, state, _ = self.add_project('one', 1)
+        state.enqueue(None, 'start', 'Earlier unbound attempt', item=7)
+        state.finish(1, 'waiting_for_user', 'Old question')
+        self.manager.register('example/one', 'manual', self.root / 'one', 'main', [7, 8])
+        state.enqueue('manual', 'continue', 'Follow-up', item=8)
+        state.finish(2, 'waiting_for_user', 'Another old question')
+        state.enqueue('manual', 'continue', 'Answer', item=7)
+        state.finish(3, 'succeeded', 'Done')
+        self.manager.sync_queue()
+        self.assertEqual([row['id'] for row in monitor.snapshot(self.manager.directory)['commands']], [3])
+        self.assertEqual(state.row(1)['state'], 'waiting_for_user')
+        self.assertEqual(state.row(2)['state'], 'waiting_for_user')
+        state.enqueue('manual', 'continue', 'Uncertain turn', item=7)
+        state.finish(4, 'unknown', 'Inspect work')
+        state.enqueue('manual', 'continue', 'Later turn', item=8)
+        state.finish(5, 'succeeded', 'Done')
+        state.enqueue('manual', 'continue', 'Current turn', item=7)
+        state.enqueue('manual', 'continue', 'Queued turn', item=7)
+        with state.db:
+            state.db.execute("UPDATE commands SET state='running' WHERE id=6")
+        self.manager.sync_queue()
+        rows = monitor.snapshot(self.manager.directory)['commands']
+        self.assertEqual({row['id'] for row in rows}, {4, 6, 7})
+        self.assertTrue(monitor.snapshot(self.manager.directory)['paused'])
+
+    def test_monitor_hides_closed_items_without_changing_outcomes_or_safety_holds(self):
+        _, state, _ = self.add_project('one', 1)
+        statuses = ('waiting_for_user', 'succeeded', 'failed', 'cancelled', 'unknown', 'blocked', 'queued', 'running')
+        for number, status in enumerate(statuses, 1):
+            state.enqueue(None, 'start', 'Task', item=number)
+            if status != 'queued':
+                state.finish(number, status, 'Saved explanation')
+        cache = {str(number): {'state': 'CLOSED', 'title': 'Cached title', 'checked': 1}
+                 for number in range(1, 9)}
+        cache['2']['state'] = 'MERGED'
+        with state.db:
+            state.set('monitor_issues', json.dumps(cache))
+        self.manager.sync_queue()
+        with patch.object(Account, 'api', side_effect=AssertionError('Read-only monitor called GitHub')):
+            data = monitor.snapshot(self.manager.directory)
+        self.assertEqual(data['hidden_closed'], 4)
+        self.assertEqual({row['state'] for row in data['commands']}, set(monitor.ALWAYS_VISIBLE))
+        self.assertTrue(all('Cached title' in row['task'] for row in data['commands']))
+        self.assertEqual([state.row(number)['state'] for number in range(1, 9)], list(statuses))
+        self.assertTrue(data['paused'])
+
+    def test_monitor_does_not_group_unrelated_task_names_with_issue_numbers(self):
+        _, state, _ = self.add_project('one', 1)
+        self.manager.register('example/one', 'issue-9', self.root / 'one', 'main', [7])
+        state.enqueue('issue-9', 'start', 'Manual session', item=7)
+        state.finish(1, 'waiting_for_user', 'Question')
+        state.enqueue(None, 'start', 'Another issue', item=9)
+        state.finish(2, 'succeeded', 'Done')
+        self.manager.sync_queue()
+        self.assertEqual({row['id'] for row in monitor.snapshot(self.manager.directory)['commands']}, {1, 2})
+
+    def test_issue_status_refresh_batches_deduplicates_and_persists_ttl(self):
+        _, state, worker = self.add_project('one', 1)
+        for number in (7, 7, 8, 9):
+            ident = state.enqueue(None, 'start', 'Task', item=number)
+            state.finish(ident, 'waiting_for_user', 'Question')
+        known = {7: 'CLOSED', 8: 'OPEN', 9: 'MERGED'}
+        def reply(numbers):
+            return {str(number): {'state': known[number], 'title': 'Task'} for number in numbers}
+        with patch.object(worker.github, 'issue_states', side_effect=reply) as api, \
+                patch('murphy.manager.time.monotonic', return_value=0) as clock, \
+                patch('murphy.manager.time.time', return_value=10000) as wall:
+            self.manager.refresh_issue_states()
+            self.assertEqual(api.call_args.args[0], [7, 8, 9])
+            clock.return_value, wall.return_value = 299, 10299
+            self.manager.refresh_issue_states()
+            self.assertEqual(api.call_count, 1)
+            clock.return_value, wall.return_value = 300, 10300
+            self.manager.refresh_issue_states()
+            self.assertEqual(api.call_args.args[0], [8])
+            clock.return_value, wall.return_value = 3600, 13600
+            self.manager.refresh_issue_states()
+            self.assertEqual(set(api.call_args.args[0]), {7, 8, 9})
+            reopened = Manager(self.manager.directory)
+            self.addCleanup(reopened.close)
+            reopened.load()
+            with patch.object(reopened.projects[1][2].github, 'issue_states') as repeated:
+                reopened.refresh_issue_states()
+                repeated.assert_not_called()
+        self.assertTrue(all(row[0] == 'waiting_for_user' for row in state.db.execute('SELECT state FROM commands')))
+
+    def test_issue_status_failures_back_off_and_retain_cache(self):
+        _, state, worker = self.add_project('one', 1)
+        state.enqueue(None, 'start', 'Task', item=7)
+        state.finish(1, 'waiting_for_user', 'Question')
+        saved = json.dumps({'7': {'state': 'CLOSED', 'title': 'Task', 'checked': 1}})
+        with state.db:
+            state.set('monitor_issues', saved)
+        with patch.object(worker.github, 'issue_states', side_effect=RuntimeError('API unavailable')) as api, \
+                patch('murphy.manager.time.monotonic', return_value=0) as clock, \
+                patch('murphy.manager.time.time', return_value=10000):
+            self.manager.refresh_issue_states()
+            clock.return_value = 299
+            self.manager.refresh_issue_states()
+            self.assertEqual(api.call_count, 1)
+            clock.return_value = 300
+            self.manager.refresh_issue_states()
+            self.assertEqual(api.call_count, 2)
+        self.assertEqual(state.setting('monitor_issues'), saved)
+        self.assertEqual(state.row(1)['state'], 'waiting_for_user')
+        self.assertEqual(self.manager.setting('paused'), '0')
+
+    def test_missing_issue_status_is_not_closure_and_does_not_starve_later_batches(self):
+        _, state, worker = self.add_project('one', 1)
+        for number in range(1, 52):
+            state.enqueue(None, 'start', 'Task', item=number)
+            state.finish(number, 'waiting_for_user', 'Question')
+        self.manager.sync_queue()
+        with patch.object(worker.github, 'issue_states', return_value={}) as api, \
+                patch('murphy.manager.time.monotonic', return_value=0) as clock, \
+                patch('murphy.manager.time.time', return_value=10000) as wall:
+            self.manager.refresh_issue_states()
+            self.assertEqual(len(api.call_args.args[0]), 50)
+            self.assertEqual(monitor.snapshot(self.manager.directory)['hidden_closed'], 0)
+            clock.return_value, wall.return_value = 300, 10300
+            self.manager.refresh_issue_states()
+            self.assertEqual(api.call_args.args[0][0], 51)
+
+    def test_monitor_layout_keeps_names_and_footer_when_resized(self):
+        _, state, _ = self.add_project('one', 1)
+        for number in range(1, 15):
+            state.enqueue(None, 'start', 'Task', item=number)
+            state.finish(number, 'waiting_for_user', 'One line\nA very long second line ' * 10)
+        self.manager.sync_queue()
+        data = monitor.snapshot(self.manager.directory)
+        for width, height in ((20, 8), (60, 12), (80, 20), (108, 24), (200, 40)):
+            text = monitor.render(data, width, height)
+            self.assertLessEqual(len(text.splitlines()), height)
+            self.assertTrue(all(len(line) <= width for line in text.splitlines()))
+            self.assertIn('Ctrl+C', text.splitlines()[-1])
+            self.assertIn('example/one', text)
+        self.assertEqual(monitor.fit('Bikeparks-pl/bikeparks2', 12), 'Bikeparks-p…')
+        self.assertEqual(monitor.fit('猫猫猫', 5), '猫猫…')
+        self.assertEqual(monitor.fit('anything', 0), '')
+        self.assertEqual(monitor.render(data, 0, 0), '')
 
     def test_worker_record_checks_process_birth_and_cleans_up_on_error(self):
         directory = self.manager.directory
@@ -650,7 +798,7 @@ Path(sys.argv[1], 'stopped').write_text(str(stopped))
              'started': '1970-01-01T00:10:00+00:00', 'finished': '1970-01-01T00:11:00+00:00',
              'detail': '', 'activity': None}]}
         text = monitor.render(data, 100)
-        header, first = text.splitlines()[3:5]
+        header, first = text.splitlines()[3], text.splitlines()[5]
         self.assertEqual(header.index('REPO'), first.index('example/one'))
         self.assertEqual(header.index('STATUS'), first.index('PRACUJE'))
         self.assertIn('aktywne: 1/2', text)
@@ -662,7 +810,7 @@ Path(sys.argv[1], 'stopped').write_text(str(stopped))
         self.assertIn('01:00', monitor.render(data))  # A finished duration stays fixed.
         for width in (20, 60, 80, 100):
             self.assertTrue(all(len(line) <= width for line in monitor.render(data, width).splitlines()))
-        self.assertIn('…', monitor.fit('Very long task title', 8))
+        self.assertEqual(monitor.fit('Very long task title', 8), 'Very lo…')
         self.assertEqual(monitor.fit('猫', 2), '猫')
         data['paused'] = True
         self.assertIn('PAUZA', monitor.render(data))

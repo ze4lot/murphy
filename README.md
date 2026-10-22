@@ -216,10 +216,16 @@ murphy run --monitor    # Start the worker with a live table
 murphy run -m           # Short alias for the same mode
 ```
 
-The table shows installation-wide command IDs, repositories, issue numbers and saved titles,
-status and execution time. Active and unresolved commands appear first, followed by the five
-most recently finished commands. Local commands show their task name. A queued issue's title
-may be unavailable until the worker fetches it. Pause/resume/cancel control commands are omitted.
+The table shows installation-wide command IDs, repositories, issue numbers and saved/cached titles,
+status and execution time. It sizes its columns to the terminal and their content, keeps visible
+text when shortening a cell, and uses a stacked layout in narrow terminals. The footer stays
+visible when the task list is taller than the terminal; a counter shows omitted rows.
+
+Only the latest command per task/session is shown, so an earlier question disappears after a
+continuation completes. Queued, running, blocked and unknown commands always remain visible,
+even if a later turn exists. Active and unresolved commands appear first, followed by up to five
+recent completions. Local commands show their task name. A queued issue's title may be unavailable
+until the worker fetches it. Pause/resume/cancel control commands are omitted.
 The header distinguishes an idle, busy, paused or stopped worker and shows active/queued counts.
 An old `running` row without its coordinator is displayed as `BRAK WORKERA`, not as live work;
 the monitor does not reconcile it or change the recorded outcome.
@@ -228,7 +234,24 @@ While a command runs, the view shows the latest command or agent message found i
 tail of its existing execution JSONL. `Log: N s temu` measures the last log write, not the
 duration of the displayed action. Silence is not treated as a hang. Waiting, blocked, failed
 and unknown commands show their saved explanation. Long text is shortened to fit the terminal;
-narrow terminals use two lines per task. No model calls or extra GitHub requests are made.
+narrow terminals use two lines per task. The monitor makes no model calls or GitHub requests.
+
+The worker refreshes a local issue/PR status cache with at most one GraphQL batch (up to 50
+distinct inactive items) per repository every five minutes. Recently checked items are skipped
+across worker restarts; closed/merged items are rechecked at most hourly to detect reopening.
+Normal executor identity verification still applies to each request. Only sessions represented
+in local task state are queried, not the repository's entire issue history. Failed requests
+back off for five minutes and preserve the last known states. A missing/inaccessible item does
+not mean it is closed and does not discard valid results for the other items in the batch.
+
+Closed issues and closed/merged PRs disappear from the default view, with a hidden-item count.
+This is presentation only: commands, reports, worktrees and sessions are retained, and
+`murphy status` still includes the full command history. Queued/running commands and blocked or
+unknown outcomes are never hidden or automatically resolved by this cache. Closure is based
+on the tracked issue/PR itself; merging a separate PR does not imply its issue is closed.
+An open issue can take up to the next refresh to disappear after closing; reopening a cached
+closed item is detected by its slower refresh. The worker updates this cache even without `-m`,
+so standalone monitors share it without multiplying GitHub requests.
 
 The display normally refreshes once per second, independently of worker API calls. `Ctrl+C`
 in `murphy monitor` only closes the view; in `murphy run -m` it stops the worker and waits for
