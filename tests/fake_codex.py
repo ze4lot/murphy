@@ -8,6 +8,33 @@ import sys
 import time
 import uuid
 
+if sys.argv[1:] == ['app-server']:
+    # Account metadata only: this branch never creates a model execution/session.
+    for line in sys.stdin:
+        request = json.loads(line)
+        if request['method'] == 'initialize':
+            assert request['params']['clientInfo']['name'] == 'murphy_monitor'
+            print(json.dumps({'id': request['id'], 'result': {}}), flush=True)
+        elif request['method'] == 'account/rateLimits/read':
+            mode = os.environ.get('MURPHY_TEST_LIMITS_MODE', '')
+            if mode == 'timeout':
+                time.sleep(30)
+            elif mode == 'invalid':
+                print('invalid JSON', flush=True)
+            elif mode == 'error':
+                print(json.dumps({'id': request['id'], 'error': {'message': 'Not signed in'}}), flush=True)
+            else:
+                limits = {'primary': {'usedPercent': 25, 'windowDurationMins': 300},
+                          'secondary': {'usedPercent': 81, 'windowDurationMins': 10080}}
+                result = {'rateLimits': {'primary': {'usedPercent': 99, 'windowDurationMins': 60}}}
+                if mode != 'legacy':
+                    result['rateLimitsByLimitId'] = {'codex': limits}
+                print(json.dumps({'method': 'account/rateLimits/updated', 'params': {}}), flush=True)
+                print(json.dumps({'id': request['id'], 'result': result}), flush=True)
+        else:
+            assert request['method'] == 'initialized'
+    sys.exit(0)
+
 prompt = sys.stdin.read()
 thread = sys.argv[sys.argv.index('resume') + 1] if 'resume' in sys.argv else str(uuid.uuid4())
 

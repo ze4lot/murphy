@@ -596,6 +596,10 @@ class ManagerTests(unittest.TestCase):
         with patch.object(Account, 'api', side_effect=AssertionError('Read-only monitor called GitHub')):
             data = monitor.snapshot(self.manager.directory)
         self.assertEqual(data['hidden_closed'], 4)
+        text = monitor.render(data, 120)
+        self.assertIn('w kolejce: 1 · zakończone: 4', text.splitlines()[0])
+        self.assertNotIn('Ukryto', text)
+        self.assertNotIn('zamknięte/usunięte', text)
         self.assertEqual({row['state'] for row in data['commands']}, set(monitor.ALWAYS_VISIBLE))
         self.assertTrue(all('Cached title' in row['task'] for row in data['commands']))
         self.assertEqual([state.row(number)['state'] for number in range(1, 9)], list(statuses))
@@ -716,12 +720,76 @@ class ManagerTests(unittest.TestCase):
             text = monitor.render(data, width, height)
             self.assertLessEqual(len(text.splitlines()), height)
             self.assertTrue(all(len(line) <= width for line in text.splitlines()))
-            self.assertIn('Ctrl+C', text.splitlines()[-1])
+            self.assertIn('Codex:', text.splitlines()[-1])
             self.assertIn('example/one', text)
         self.assertEqual(monitor.fit('Bikeparks-pl/bikeparks2', 12), 'Bikeparks-p…')
         self.assertEqual(monitor.fit('猫猫猫', 5), '猫猫…')
         self.assertEqual(monitor.fit('anything', 0), '')
         self.assertEqual(monitor.render(data, 0, 0), '')
+
+    def test_codex_limits_reads_account_windows_and_legacy_response_without_a_turn(self):
+        limits = monitor.read_codex_limits(FAKE)
+        self.assertEqual(monitor.usage_label(limits), 'Codex: 5h 25% · 7d 81% zużycia')
+        with patch.dict(os.environ, MURPHY_TEST_LIMITS_MODE='legacy'):
+            self.assertEqual(monitor.usage_label(monitor.read_codex_limits(FAKE)), 'Codex: 1h 99% zużycia')
+
+    def test_codex_limits_failures_and_timeout_are_bounded_and_reap_the_helper(self):
+        real_popen = subprocess.Popen
+        children = []
+        def launch(*args, **kwargs):
+            process = real_popen(*args, **kwargs)
+            children.append(process)
+            return process
+        for mode in ('invalid', 'error', 'timeout'):
+            with self.subTest(mode=mode), patch.dict(os.environ, MURPHY_TEST_LIMITS_MODE=mode), \
+                    patch.object(monitor.subprocess, 'Popen', side_effect=launch):
+                started = time.monotonic()
+                self.assertIsNone(monitor.read_codex_limits(FAKE, timeout=0.3))
+                self.assertLess(time.monotonic() - started, 2)
+                self.assertIsNotNone(children[-1].returncode)
+
+    def test_codex_usage_refreshes_in_background_using_saved_executable_and_throttles_failures(self):
+        future = monitor.concurrent.futures.Future()
+        with monitor.CodexUsage(self.manager.directory) as usage, \
+                patch.object(usage.pool, 'submit', return_value=future) as submit, \
+                patch.object(monitor.time, 'monotonic', return_value=0) as clock:
+            self.assertIsNone(usage.read())  # A pending request never blocks rendering.
+            self.assertIsNone(usage.read())
+            submit.assert_called_once_with(monitor.read_codex_limits, FAKE)
+            expected = {'primary': {'usedPercent': 0, 'windowDurationMins': 300}}
+            future.set_result(expected)
+            self.assertEqual(usage.read(), expected)
+            clock.return_value = 59
+            self.assertEqual(usage.read(), expected)
+            submit.assert_called_once()
+            failed = monitor.concurrent.futures.Future()
+            failed.set_exception(OSError('No executable'))
+            submit.return_value = failed
+            clock.return_value = 60
+            self.assertIsNone(usage.read())  # Do not present an old value as current.
+            self.assertIsNone(usage.read())
+            self.assertEqual(submit.call_count, 2)
+
+    def test_monitor_usage_footer_survives_clipping_and_updates_plain_output(self):
+        data = monitor.snapshot(self.manager.directory)
+        data['codex_limits'] = {'primary': {'usedPercent': 0, 'windowDurationMins': 300},
+                                'secondary': {'usedPercent': 100, 'windowDurationMins': 10080}}
+        with patch('sys.stdout', new_callable=io.StringIO) as output:
+            terminal = monitor.Terminal('Ctrl+C')
+            terminal.draw(data)
+            terminal.draw(data)
+            data['codex_limits'] = {'primary': {'usedPercent': 1, 'windowDurationMins': 300}}
+            terminal.draw(data)
+        self.assertEqual(output.getvalue().count('Murphy ·'), 2)
+        self.assertIn('Codex: 5h 0% · 7d 100% zużycia · Ctrl+C', output.getvalue())
+        for width, height in ((20, 8), (60, 12), (100, 24)):
+            text = monitor.render(data, width, height)
+            self.assertIn('Codex: 5h 1%', text.splitlines()[-1])
+            self.assertLessEqual(len(text.splitlines()), height)
+        for invalid in (None, {}, {'primary': {'usedPercent': None, 'windowDurationMins': 300}},
+                        {'primary': {'usedPercent': -1, 'windowDurationMins': 300}},
+                        {'primary': {'usedPercent': True, 'windowDurationMins': 300}}):
+            self.assertEqual(monitor.usage_label(invalid), 'Codex: brak danych')
 
     def test_worker_record_checks_process_birth_and_cleans_up_on_error(self):
         directory = self.manager.directory
@@ -775,7 +843,8 @@ class ManagerTests(unittest.TestCase):
         output = io.StringIO()
         output.isatty = lambda: True
         with monitor.worker_record(self.manager.directory, 1), patch('sys.stdout', output), \
-                patch.dict(os.environ, TERM='xterm'), patch.object(monitor.time, 'sleep', side_effect=KeyboardInterrupt):
+                patch.dict(os.environ, TERM='xterm'), patch.object(monitor.CodexUsage, 'read', return_value=None), \
+                patch.object(monitor.time, 'sleep', side_effect=KeyboardInterrupt):
             self.assertEqual(monitor.watch(self.manager.directory), 0)
             self.assertIsNotNone(monitor.read_worker(self.manager.directory))
         self.assertIn('\x1b[?1049h', output.getvalue())
@@ -803,6 +872,8 @@ Path(sys.argv[1], 'stopped').write_text(str(stopped))
         real_popen = subprocess.Popen
         children = []
         def launch(command, **kwargs):
+            if command == [FAKE, 'app-server']:
+                return real_popen(command, **kwargs)
             self.assertEqual(command, [sys.executable, '-m', 'murphy', '--state-dir', str(self.manager.directory), 'run'])
             child = real_popen([sys.executable, '-c', source, str(self.manager.directory), str(os.getpid())],
                                cwd=ROOT, **kwargs)
@@ -889,6 +960,8 @@ with patch.object(Account,'api',lambda account,*a,**kw: case.account_api(account
 '''
         real_popen = subprocess.Popen
         def launch(command, **kwargs):
+            if command == [FAKE, 'app-server']:
+                return real_popen(command, **kwargs)
             return real_popen([sys.executable, '-c', source, str(self.manager.directory), str(fixture), str(os.getpid())],
                               cwd=ROOT, **kwargs)
         with patch.object(monitor.subprocess, 'Popen', side_effect=launch), \
@@ -902,6 +975,8 @@ with patch.object(Account,'api',lambda account,*a,**kw: case.account_api(account
     def test_run_monitor_preserves_failure_exit_status(self):
         real_popen = subprocess.Popen
         def launch(command, **kwargs):
+            if command == [FAKE, 'app-server']:
+                return real_popen(command, **kwargs)
             return real_popen([sys.executable, '-c', "import sys; print('failed turn',file=sys.stderr); sys.exit(2)"], **kwargs)
         with patch.object(monitor.subprocess, 'Popen', side_effect=launch), \
                 patch('sys.stdout', new_callable=io.StringIO), patch('sys.stderr', new_callable=io.StringIO) as errors:
