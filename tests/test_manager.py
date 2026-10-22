@@ -73,6 +73,9 @@ class ManagerTests(unittest.TestCase):
     def github_api(self, path, method='GET', payload=None, pages=False, missing_ok=False):
         repository = b.CONFIG.repository
         self.assertIn(repository, self.repos)
+        if path == 'graphql':
+            return {'data': {'repository': {'issueOrPullRequest': {'projectItems': {
+                'nodes': [], 'pageInfo': {'hasNextPage': False, 'endCursor': None}}}}}}
         if path == 'user':
             if b.CONFIG.gh_config_dir:
                 return dict(self.executor)

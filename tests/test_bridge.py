@@ -32,6 +32,10 @@ class Api:
         self.data = {}
         self.report_calls = []
         self.issues = {}
+        self.progress_calls = []
+
+    def mark_in_progress(self, number):
+        self.progress_calls.append(number)
 
     def identity(self):
         pass
@@ -54,6 +58,62 @@ class Api:
     def report(self, row):
         self.report_calls.append(dict(row))
         return 1000 + row['id']
+
+
+class ProjectStatusTests(unittest.TestCase):
+    def item(self, ident='item-1', status='todo', **changes):
+        item = {'id': ident, 'isArchived': False,
+                'project': {'id': 'project-1', 'closed': False,
+                            'field': {'id': 'status-1', 'options': [
+                                {'id': 'todo', 'name': 'Todo'},
+                                {'id': 'doing', 'name': 'In progress'}]}},
+                'fieldValueByName': {'optionId': status} if status else None}
+        return dict(item, **changes)
+
+    def page(self, *items, cursor=None):
+        return {'data': {'repository': {'issueOrPullRequest': {'projectItems': {
+            'nodes': list(items), 'pageInfo': {'hasNextPage': cursor is not None, 'endCursor': cursor}}}}}}
+
+    def updated(self, ident):
+        return {'data': {'updateProjectV2ItemFieldValue': {'projectV2Item': {'id': ident}}}}
+
+    def test_updates_only_items_with_a_different_or_unset_status(self):
+        with patch.object(b.GitHub, 'api', side_effect=[
+                self.page(self.item(), self.item('item-2', None), self.item('item-3', 'doing')),
+                self.updated('item-1'), self.updated('item-2')]) as api:
+            b.GitHub().mark_in_progress(226)
+        self.assertEqual(api.call_count, 3)
+        self.assertEqual(api.call_args_list[0].args[2]['variables'],
+                         {'owner': 'example', 'repo': 'project', 'number': 226, 'after': None})
+        self.assertEqual([call.args[2]['variables']['input'] for call in api.call_args_list[1:]], [
+            {'projectId': 'project-1', 'itemId': ident, 'fieldId': 'status-1',
+             'value': {'singleSelectOptionId': 'doing'}} for ident in ('item-1', 'item-2')])
+
+    def test_paginates_projects_before_updating(self):
+        with patch.object(b.GitHub, 'api', side_effect=[self.page(cursor='next'),
+                self.page(self.item()), self.updated('item-1')]) as api:
+            b.GitHub().mark_in_progress(229)
+        self.assertEqual(api.call_args_list[1].args[2]['variables']['after'], 'next')
+
+    def test_skips_absent_archived_closed_or_unsupported_projects(self):
+        closed = self.item()
+        closed['project']['closed'] = True
+        unsupported = self.item()
+        unsupported['project']['field']['options'] = [{'id': 'todo', 'name': 'Todo'}]
+        no_field = self.item()
+        no_field['project']['field'] = None
+        for page in (self.page(), self.page(self.item(isArchived=True), closed, unsupported, no_field)):
+            with self.subTest(page=page), patch.object(b.GitHub, 'api', return_value=page) as api:
+                b.GitHub().mark_in_progress(226)
+                self.assertEqual(api.call_count, 1)
+
+    def test_graphql_errors_and_wrong_mutation_identity_are_reported(self):
+        error = {'errors': [{'message': 'Missing project permission'}]}
+        for replies in ([error], [self.page(self.item()), error],
+                        [self.page(self.item()), self.updated('wrong-item')]):
+            with self.subTest(replies=replies), patch.object(b.GitHub, 'api', side_effect=replies):
+                with self.assertRaises((RuntimeError, ValueError)):
+                    b.GitHub().mark_in_progress(226)
 
 
 class BridgeTests(unittest.TestCase):
@@ -83,6 +143,39 @@ class BridgeTests(unittest.TestCase):
 
     def execute(self, once=True):
         self.worker.run(once=once)
+
+    def test_start_and_continue_mark_project_status_before_model_invocation(self):
+        self.worker.github = self.api
+        first = self.state.enqueue('a', 'start', 'read', item=226)
+        second = self.state.enqueue('a', 'continue', 'read', item=226)
+        original = self.worker.run_codex
+        def run(row, *args):
+            self.assertEqual(len(self.api.progress_calls), 1 if row['verb'] == 'start' else 2)
+            return original(row, *args)
+        with patch.object(self.worker, 'run_codex', side_effect=run):
+            self.execute()
+            self.execute()
+        self.assertEqual(self.api.progress_calls, [226, 226])
+        self.assertEqual(self.state.row(first)['state'], 'succeeded')
+        self.assertEqual(self.state.row(second)['state'], 'succeeded')
+
+    def test_project_status_failure_stops_before_model_and_can_be_retried(self):
+        self.worker.github = self.api
+        ident = self.state.enqueue('a', 'start', 'read', item=226)
+        with patch.object(self.api, 'mark_in_progress', side_effect=RuntimeError('Missing project permission')):
+            with patch.object(self.worker, 'run_codex') as model:
+                self.execute()
+                model.assert_not_called()
+        self.assertEqual(self.state.row(ident)['state'], 'failed')
+        retry = self.state.enqueue('a', 'start', 'read', item=226)
+        self.execute()
+        self.assertEqual(self.state.row(retry)['state'], 'succeeded')
+
+    def test_invalid_start_does_not_change_project_status(self):
+        self.worker.github = self.api
+        self.state.enqueue('a', 'continue', 'read', item=226)
+        self.execute()
+        self.assertEqual(self.api.progress_calls, [])
 
     def test_cli_loads_config_and_refuses_a_different_project_state(self):
         args = [sys.executable, str(ROOT.parent / 'bridge.py'), '--config', str(self.config_path),

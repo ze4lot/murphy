@@ -205,6 +205,72 @@ class GitHub:
             raise ValueError('Ambiguous parent feature branch; register the task explicitly')
         return next(iter(heads)) if heads else default
 
+    def mark_in_progress(self, number):
+        query = '''query($owner: String!, $repo: String!, $number: Int!, $after: String) {
+          repository(owner: $owner, name: $repo) {
+            issueOrPullRequest(number: $number) {
+              ... on Issue { projectItems(first: 100, after: $after) { ...items } }
+              ... on PullRequest { projectItems(first: 100, after: $after) { ...items } }
+            }
+          }
+        }
+        fragment items on ProjectV2ItemConnection {
+          pageInfo { hasNextPage endCursor }
+          nodes {
+            id isArchived
+            project {
+              id closed
+              field(name: "Status") {
+                ... on ProjectV2SingleSelectField { id options { id name } }
+              }
+            }
+            fieldValueByName(name: "Status") {
+              ... on ProjectV2ItemFieldSingleSelectValue { optionId }
+            }
+          }
+        }'''
+        mutation = '''mutation($input: UpdateProjectV2ItemFieldValueInput!) {
+          updateProjectV2ItemFieldValue(input: $input) { projectV2Item { id } }
+        }'''
+        owner, repo = CONFIG.repository.split('/')
+        variables = dict(owner=owner, repo=repo, number=number, after=None)
+        updates = []
+        while True:
+            result = self.api('graphql', 'POST', {'query': query, 'variables': variables})
+            if result.get('errors'):
+                raise RuntimeError('GitHub Projects lookup failed: ' + json.dumps(result['errors'])[:400])
+            item = result['data']['repository']['issueOrPullRequest']
+            if item is None:
+                raise ValueError('GitHub Projects target issue/PR was not found')
+            items = item['projectItems']
+            for item in items['nodes']:
+                project = item['project']
+                if item['isArchived'] or project['closed']:
+                    continue
+                field = project['field'] or {}
+                options = [option for option in field.get('options', [])
+                           if option['name'].strip().casefold() == 'in progress']
+                if not options:
+                    continue
+                if len(options) != 1:
+                    raise ValueError('Ambiguous In Progress option in GitHub Projects')
+                option = options[0]['id']
+                if (item['fieldValueByName'] or {}).get('optionId') != option:
+                    updates.append(dict(projectId=project['id'], itemId=item['id'],
+                                        fieldId=field['id'], value={'singleSelectOptionId': option}))
+            if not items['pageInfo']['hasNextPage']:
+                break
+            cursor = items['pageInfo']['endCursor']
+            if not cursor or cursor == variables['after']:
+                raise ValueError('Invalid GitHub Projects pagination cursor')
+            variables = dict(variables, after=cursor)
+        for update in updates:
+            result = self.api('graphql', 'POST', {'query': mutation, 'variables': {'input': update}})
+            if result.get('errors'):
+                raise RuntimeError('GitHub Projects update failed: ' + json.dumps(result['errors'])[:400])
+            if result['data']['updateProjectV2ItemFieldValue']['projectV2Item']['id'] != update['itemId']:
+                raise ValueError('Unexpected GitHub Projects update result')
+
     def report(self, row):
         marker = f'<!-- codex-bridge:{row["execution_id"]} -->'
         path = f'repos/{CONFIG.repository}/issues/{row["item"]}/comments'
@@ -766,6 +832,12 @@ class Worker:
         except Exception as error:
             self.state.finish(row['id'], 'unknown', str(error))
             return
+        if self.github and row['item'] is not None:
+            try:
+                self.github.mark_in_progress(row['item'])
+            except Exception as error:
+                self.state.finish(row['id'], 'failed', f'GitHub Projects status check/update failed; no model invoked: {error}')
+                return
         with self.state.db:
             # Older registries may have an unstarted task without an explicit effort.
             # Pin the new default only at first start, preserving existing sessions.
