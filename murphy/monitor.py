@@ -43,7 +43,7 @@ def issue_cache(value):
     try:
         cache = json.loads(value or '{}')
         return {key: item for key, item in cache.items()
-                if isinstance(item, dict) and item.get('state') in ('OPEN', 'CLOSED', 'MERGED', 'UNKNOWN')
+                if isinstance(item, dict) and item.get('state') in ('OPEN', 'CLOSED', 'MERGED', 'DELETED', 'UNKNOWN')
                 and isinstance(item.get('title', ''), str)
                 and isinstance(item.get('checked'), (int, float))}
     except (ValueError, AttributeError, TypeError):
@@ -143,7 +143,7 @@ def snapshot(directory=None):
                 if ident is None:  # Enrollment belongs to the coordinator, including after a crash.
                     continue
                 issue = cache.get(str(row['item']), {})
-                if issue.get('state') in ('CLOSED', 'MERGED') and row['state'] not in ALWAYS_VISIBLE:
+                if issue.get('state') in ('CLOSED', 'MERGED', 'DELETED') and row['state'] not in ALWAYS_VISIBLE:
                     hidden_closed += 1
                     continue
                 title = ''
@@ -211,7 +211,7 @@ def render(data, width=100, height=24, footer='Ctrl+C — zamknij podgląd'):
              'Odświeżono: ' + dt.datetime.fromtimestamp(observed).strftime('%H:%M:%S'), '']
     bottom = []
     if data.get('hidden_closed'):
-        bottom.append(f'Ukryto zamknięte w GitHub: {data["hidden_closed"]}')
+        bottom.append(f'Ukryto zamknięte/usunięte w GitHub: {data["hidden_closed"]}')
     if data.get('diagnostic'):
         bottom.append('Worker: ' + data['diagnostic'])
     bottom.extend(['', footer])

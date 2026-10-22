@@ -88,6 +88,36 @@ class IssueStateTests(unittest.TestCase):
         with patch.object(b.GitHub, 'api', return_value=response):
             self.assertEqual(b.GitHub().issue_states([7, 8]), {'8': {'state': 'MERGED', 'title': 'Merged PR'}})
 
+    def test_missing_graphql_item_uses_rest_410_to_confirm_deletion(self):
+        response = self.response()
+        response['data']['repository']['i7'] = None
+        response['errors'] = [{'type': 'NOT_FOUND', 'path': ['repository', 'i7']}]
+        replies = [subprocess.CompletedProcess([], 1, json.dumps(response), 'GraphQL NOT_FOUND'),
+                   subprocess.CompletedProcess([], 1, '{"message":"This issue was deleted"}', 'gh: This issue was deleted (HTTP 410)')]
+        with patch.object(b.subprocess, 'run', side_effect=replies) as request:
+            states = b.GitHub().issue_states([7, 8])
+        self.assertEqual(states['7'], {'state': 'DELETED', 'title': ''})
+        self.assertEqual(states['8']['state'], 'MERGED')
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(request.call_args.args[0][-1], 'repos/example/project/issues/7')
+
+    def test_rest_missing_forbidden_and_failed_fallbacks_do_not_imply_deletion(self):
+        response = self.response()
+        response['data']['repository']['i7'] = None
+        for status in (404, 403, 500):
+            replies = [subprocess.CompletedProcess([], 0, json.dumps(response), ''),
+                       subprocess.CompletedProcess([], 1, '{}', f'gh: Request failed (HTTP {status})')]
+            with self.subTest(status=status), patch.object(b.subprocess, 'run', side_effect=replies):
+                states = b.GitHub().issue_states([7, 8])
+            self.assertNotIn('7', states)
+            self.assertEqual(states['8']['state'], 'MERGED')
+
+    def test_rest_410_remains_an_error_without_explicit_opt_in(self):
+        reply = subprocess.CompletedProcess([], 1, '{}', 'gh: This issue was deleted (HTTP 410)')
+        with patch.object(b.subprocess, 'run', return_value=reply):
+            with self.assertRaises(RuntimeError):
+                b.GitHub().api('repos/example/project/issues/7', missing_ok=True)
+
     def test_status_reader_rejects_wrong_identity_errors_and_malformed_data(self):
         for change in ('repository', 'number', 'state', 'permission', 'root', 'title'):
             response = self.response()

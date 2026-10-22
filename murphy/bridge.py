@@ -147,7 +147,7 @@ def command(body):
 
 
 class GitHub:
-    def api(self, path, method='GET', payload=None, pages=False, missing_ok=False, partial_graphql=False):
+    def api(self, path, method='GET', payload=None, pages=False, missing_ok=False, partial_graphql=False, gone_ok=False):
         args = [CONFIG.gh, 'api', '--hostname', 'github.com', '--method', method, path]
         if pages:
             args += ['--paginate', '--slurp']
@@ -157,6 +157,8 @@ class GitHub:
             data = json.dumps(payload)
         result = subprocess.run(args, input=data, text=True, capture_output=True, timeout=25, env=environment(CONFIG))
         if result.returncode:
+            if gone_ok and '(HTTP 410)' in result.stderr:
+                return {'state': 'DELETED'}
             if missing_ok and '(HTTP 404)' in result.stderr:
                 return None
             if partial_graphql and path == 'graphql':
@@ -228,7 +230,13 @@ class GitHub:
         states = {}
         for number in numbers:
             item = repository.get(f'i{number}')
-            if item is None:  # Deleted/inaccessible is not evidence of closure.
+            if item is None:  # GraphQL cannot distinguish deletion from missing access.
+                try:
+                    rest = self.api(f'repos/{CONFIG.repository}/issues/{number}', missing_ok=True, gone_ok=True)
+                except (RuntimeError, OSError, subprocess.SubprocessError, json.JSONDecodeError):
+                    continue  # A failed fallback must not discard the rest of the batch.
+                if isinstance(rest, dict) and rest.get('state') == 'DELETED':
+                    states[str(number)] = {'state': 'DELETED', 'title': ''}
                 continue
             if (not isinstance(item, dict) or item.get('number') != number
                     or item.get('state') not in ('OPEN', 'CLOSED', 'MERGED') or not isinstance(item.get('title'), str)):

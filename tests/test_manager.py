@@ -45,8 +45,8 @@ class ManagerTests(unittest.TestCase):
         self.addCleanup(account_api.stop)
         test = self
         class Api:
-            def api(self, path, method='GET', payload=None, pages=False, missing_ok=False, partial_graphql=False):
-                return test.github_api(path, method, payload, pages, missing_ok, partial_graphql)
+            def api(self, path, method='GET', payload=None, pages=False, missing_ok=False, partial_graphql=False, gone_ok=False):
+                return test.github_api(path, method, payload, pages, missing_ok, partial_graphql, gone_ok)
         api = patch.object(b.GitHub, 'api', Api.api)
         api.start()
         self.addCleanup(api.stop)
@@ -71,7 +71,7 @@ class ManagerTests(unittest.TestCase):
             return self.repos[path[6:]]
         raise AssertionError(path)
 
-    def github_api(self, path, method='GET', payload=None, pages=False, missing_ok=False, partial_graphql=False):
+    def github_api(self, path, method='GET', payload=None, pages=False, missing_ok=False, partial_graphql=False, gone_ok=False):
         repository = b.CONFIG.repository
         self.assertIn(repository, self.repos)
         if path == 'graphql':
@@ -588,6 +588,8 @@ class ManagerTests(unittest.TestCase):
         cache = {str(number): {'state': 'CLOSED', 'title': 'Cached title', 'checked': 1}
                  for number in range(1, 9)}
         cache['2']['state'] = 'MERGED'
+        for number in (3, 5, 6, 7, 8):
+            cache[str(number)]['state'] = 'DELETED'
         with state.db:
             state.set('monitor_issues', json.dumps(cache))
         self.manager.sync_queue()
@@ -659,6 +661,33 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(state.setting('monitor_issues'), saved)
         self.assertEqual(state.row(1)['state'], 'waiting_for_user')
         self.assertEqual(self.manager.setting('paused'), '0')
+
+    def test_deleted_item_is_reconciled_on_startup_hidden_and_never_polled_again(self):
+        _, state, worker = self.add_project('one', 1)
+        state.enqueue(None, 'start', 'Task', item=7)
+        state.finish(1, 'succeeded', 'Done')
+        self.manager.sync_queue()
+        # Older workers could only save UNKNOWN, even immediately before restart.
+        with state.db:
+            state.set('monitor_issues', json.dumps({'7': {'state': 'UNKNOWN', 'checked': 0, 'attempted': 9999}}))
+        with patch.object(worker.github, 'issue_states', return_value={'7': {'state': 'DELETED', 'title': ''}}) as api, \
+                patch('murphy.manager.time.monotonic', return_value=0) as clock, \
+                patch('murphy.manager.time.time', return_value=10000) as wall:
+            self.manager.refresh_issue_states()
+            api.assert_called_once_with([7])
+            data = monitor.snapshot(self.manager.directory)
+            self.assertEqual(data['commands'], [])
+            self.assertEqual(data['hidden_closed'], 1)
+            clock.return_value, wall.return_value = 3600, 13600
+            self.manager.refresh_issue_states()
+            api.assert_called_once()
+            reopened = Manager(self.manager.directory)
+            self.addCleanup(reopened.close)
+            reopened.load()
+            with patch.object(reopened.projects[1][2].github, 'issue_states') as repeated:
+                reopened.refresh_issue_states()
+                repeated.assert_not_called()
+        self.assertEqual(state.row(1)['state'], 'succeeded')
 
     def test_missing_issue_status_is_not_closure_and_does_not_starve_later_batches(self):
         _, state, worker = self.add_project('one', 1)

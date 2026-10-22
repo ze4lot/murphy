@@ -448,8 +448,10 @@ class Manager:
                 if not row['item'] or row['state'] in ALWAYS_VISIBLE:
                     continue
                 saved = cache.get(str(row['item']), {})
+                if saved.get('state') == 'DELETED':
+                    continue  # Explicit HTTP 410 is retained without repeated lookups.
                 ttl = 3600 if saved.get('state') in ('CLOSED', 'MERGED') else 300
-                if checked - saved.get('attempted', saved.get('checked', 0)) >= ttl:
+                if saved.get('state') == 'UNKNOWN' or checked - saved.get('attempted', saved.get('checked', 0)) >= ttl:
                     numbers.add(row['item'])
             numbers = sorted(numbers, key=lambda number: (cache.get(str(number), {}).get('attempted', 0), number))[:50]
             if not numbers:

@@ -243,8 +243,15 @@ Normal executor identity verification still applies to each request. Only sessio
 in local task state are queried, not the repository's entire issue history. Failed requests
 back off for five minutes and preserve the last known states. A missing/inaccessible item does
 not mean it is closed and does not discard valid results for the other items in the batch.
+Only numbers missing from GraphQL receive an additional REST lookup. An explicit HTTP 410
+is cached as `DELETED` and is not polled again. HTTP 404, missing permissions and failed
+lookups remain uncertain; they never imply deletion. Valid results for other items survive
+a failed REST fallback. Unverified `UNKNOWN` cache entries are retried once on worker startup,
+then follow the same five-minute batch interval, so old unresolved entries can be reconciled
+immediately after upgrading.
 
-Closed issues and closed/merged PRs disappear from the default view, with a hidden-item count.
+Closed issues, closed/merged PRs and confirmed deleted items disappear from the default view,
+with a hidden-item count.
 This is presentation only: commands, reports, worktrees and sessions are retained, and
 `murphy status` still includes the full command history. Queued/running commands and blocked or
 unknown outcomes are never hidden or automatically resolved by this cache. Closure is based
