@@ -16,6 +16,7 @@ import time
 
 from . import bridge as b
 from . import auth
+from .monitor import worker_record
 
 
 @contextlib.contextmanager
@@ -564,7 +565,7 @@ class Manager:
         if not self.projects:
             raise ValueError('Connect a project with murphy projects add OWNER/REPOSITORY first.')
         b.subreaper()
-        with b.lock(self) as fd:
+        with b.lock(self) as fd, worker_record(self.directory, self.max_parallel_projects):
             for _, _, worker in self.projects.values():
                 worker.recover()
             self.sync_queue()

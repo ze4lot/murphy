@@ -9,6 +9,7 @@ import sys
 
 from . import __version__, bridge
 from .manager import Manager
+from . import monitor
 
 
 def main():
@@ -39,6 +40,7 @@ def main():
     add.add_argument('-i', '--interval', type=int, default=60,
                      help='Poll this repository every N seconds (default: 60, minimum: 1)')
     run = sub.add_parser('run', help='Watch all connected projects and execute the shared queue')
+    run.add_argument('-m', '--monitor', action='store_true', help='Show a live terminal table while running')
     run.add_argument('--once', action='store_true')
     run.add_argument('--poll-seconds', type=float,
                      help='Override all saved project intervals for this run')
@@ -63,6 +65,8 @@ def main():
     ingest.add_argument('--project', required=True)
     for verb in ('status', 'pause', 'resume'):
         sub.add_parser(verb)
+    view = sub.add_parser('monitor', help='Watch local worker activity without starting or changing work')
+    view.add_argument('--once', action='store_true', help='Print one snapshot and exit (also the default for pipes)')
     cancel = sub.add_parser('cancel')
     cancel.add_argument('id', type=int, help='Global command ID from status or a report')
     resolve = sub.add_parser('resolve')
@@ -77,6 +81,15 @@ def main():
                                      (not math.isfinite(args.poll_seconds) or args.poll_seconds < 1)) or
                                     args.timeout <= 0):
             raise ValueError('Poll interval >= 1s and positive timeout required.')
+        if args.action == 'monitor':
+            return monitor.watch(args.state_dir, args.once)
+        if args.action == 'run' and args.monitor:
+            options = ['--timeout', str(args.timeout), '--max-parallel-projects', str(args.max_parallel_projects)]
+            if args.poll_seconds is not None:
+                options += ['--poll-seconds', str(args.poll_seconds)]
+            if args.once:
+                options.append('--once')
+            return monitor.run_with_monitor(args.state_dir, options)
         manager = Manager(args.state_dir)
         if args.action == 'init':
             with bridge.lock(manager):

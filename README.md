@@ -207,6 +207,45 @@ Controls work locally or as whole comments in connected repositories, including 
 | `murphy cancel 12` | `/murphy cancel 12` | Cancel the global command ID, even in another project. |
 | `murphy status` | — | Inspect projects, commands and pause state. |
 
+### Terminal monitor
+
+```bash
+murphy monitor          # Watch a worker that is already running
+murphy monitor --once   # Print one snapshot and exit
+murphy run --monitor    # Start the worker with a live table
+murphy run -m           # Short alias for the same mode
+```
+
+The table shows installation-wide command IDs, repositories, issue numbers and saved titles,
+status and execution time. Active and unresolved commands appear first, followed by the five
+most recently finished commands. Local commands show their task name. A queued issue's title
+may be unavailable until the worker fetches it. Pause/resume/cancel control commands are omitted.
+The header distinguishes an idle, busy, paused or stopped worker and shows active/queued counts.
+An old `running` row without its coordinator is displayed as `BRAK WORKERA`, not as live work;
+the monitor does not reconcile it or change the recorded outcome.
+
+While a command runs, the view shows the latest command or agent message found in a bounded
+tail of its existing execution JSONL. `Log: N s temu` measures the last log write, not the
+duration of the displayed action. Silence is not treated as a hang. Waiting, blocked, failed
+and unknown commands show their saved explanation. Long text is shortened to fit the terminal;
+narrow terminals use two lines per task. No model calls or extra GitHub requests are made.
+
+The display normally refreshes once per second, independently of worker API calls. `Ctrl+C`
+in `murphy monitor` only closes the view; in `murphy run -m` it stops the worker and waits for
+the usual executor/descendant cleanup. The latter runs the regular worker as a child process,
+preserves its options and exit status, and shows worker diagnostics below the table. Full
+diagnostics are printed to stderr when the worker exits. The terminal screen/cursor are restored
+on exit. When stdout is redirected (or `TERM=dumb`), `monitor` prints once; `run -m` prints
+plain snapshots when the state changes, without terminal escape sequences. `murphy status`
+keeps its existing JSON output.
+
+The standalone monitor opens existing SQLite state read-only and never creates an installation,
+enrolls commands or acquires the worker lock. Workers started with this version also maintain
+`worker.json` under that installation while holding their usual lock. The monitor validates its
+PID and Linux process birth time, so stale metadata or a reused PID cannot claim a live worker.
+Restart an older worker with this version to make its identity visible. The plain snapshot data
+is separate from terminal rendering for a later HTTP integration; no HTTP server is included.
+
 Stop the foreground worker with Ctrl+C or SIGTERM. It stops all active project executors and drains their descendants before releasing the coordinator lock. Partial edits and commits remain available. One inherited lock at `~/.local/state/murphy/worker.lock` covers all Murphy workers and descendants, including legacy workers and other `--state-dir` installations. Direct Codex runs outside Murphy are not governed by this lock.
 
 A dispatch reservation is persisted before starting an executor. An unclean executor exit, timeout, changed checkout/session or uncertain execution marks the command `unknown` and blocks **new dispatches across all projects**; other already active turns may finish. A dirty source checkout has the same global scheduling hold. Cancellation/timeout drains only the affected execution, not another active project. Coordinator failure drains all active executions; uncertain results require reconciliation. If the coordinator is killed, surviving executors detect its loss, drain their descendants and record unknown outcomes. Interrupted reservations are reconciled as unknown on restart, never automatically replayed.
@@ -227,6 +266,7 @@ Default installation directory: `~/.local/state/murphy/manager`. Supply `--state
 | Location relative to installation | Contents |
 | --- | --- |
 | `manager.sqlite` | Saved owner/executor IDs and non-secret tool settings, projects, durable global command IDs/order and pause flag. |
+| `worker.json` | Current coordinator PID, process birth time and concurrency limit; removed on normal exit and validated against `/proc` by the monitor. |
 | `auth/executor/` | Separate-account GitHub CLI configuration, when enabled. gh manages credentials in the system credential store; if unavailable it can store its token here. Keep this directory private. |
 | `checkouts/<repository-id>/` | Managed source clones. |
 | `projects/<repository-id>/state.sqlite` | Project authorization/activation, task/session bindings and execution outcomes. |
