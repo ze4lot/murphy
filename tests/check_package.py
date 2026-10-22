@@ -13,7 +13,7 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parent.parent
 VERSION = '0.1.0'
-MODULES = {'murphy/' + name for name in ('__init__.py', '__main__.py', 'auth.py', 'bridge.py', 'cli.py', 'manager.py')}
+MODULES = {'murphy/' + name for name in ('__init__.py', '__main__.py', 'auth.py', 'bridge.py', 'cli.py', 'manager.py', 'monitor.py')}
 SOURCE = MODULES | {'README.md', 'LICENSE', 'CHANGELOG.md', 'RELEASE.md', 'bridge.py', 'config.example.json',
                     'pyproject.toml', 'MANIFEST.in', 'build_backend.py', 'setup.cfg'}
 SOURCE |= {'tests/' + path.name for path in (ROOT / 'tests').glob('*.py')}
@@ -89,6 +89,12 @@ def install(path, root, wheelhouse, env):
     assert 'example-owner' in run([cli, 'init', '--gh', fake, '--git', python, '--codex', python], root, isolated)
     status = json.loads(run([cli, 'status'], root, isolated))
     assert status == {'account': 'example-owner', 'paused': False, 'projects': [], 'commands': []}, status
+    assert '-m, --monitor' in run([cli, 'run', '--help'], root, isolated)
+    monitor = run([cli, 'monitor', '--once'], root, isolated)
+    assert 'WYŁĄCZONY' in monitor and '\x1b' not in monitor, monitor
+    monitored = subprocess.run([str(cli), 'run', '-m', '--once'], cwd=root, env=isolated,
+                               capture_output=True, text=True, timeout=20)
+    assert monitored.returncode == 1 and 'Connect a project' in monitored.stderr, monitored
     assert json.loads(run([cli, 'projects', 'list'], root, isolated)) == []
     single = json.loads(run([cli, 'auth', 'status'], root, isolated))
     assert single['mode'] == 'single' and single['owner'] == single['executor']

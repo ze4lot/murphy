@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from murphy import bridge as b
 from murphy import cli
+from murphy import monitor
 from murphy.manager import Account, Manager
 
 FAKE = str(ROOT / 'tests/fake_codex.py')
@@ -490,6 +491,245 @@ class ManagerTests(unittest.TestCase):
             with patch.object(sys, 'argv', argv), patch('sys.stdout', new_callable=io.StringIO):
                 self.assertEqual(cli.main(), 0)
         self.assertEqual([project['interval'] for project in self.manager.status()['projects']], [60, 15, 120])
+
+    def test_monitor_is_read_only_and_does_not_enroll_commands(self):
+        _, state, _ = self.add_project('one', 1)
+        state.enqueue(None, 'start', 'Not enrolled yet', item=7)
+        before = self.manager.db.execute('SELECT count(*) FROM queue').fetchone()[0]
+        with patch.object(Account, 'api', side_effect=AssertionError('Monitor called GitHub')):
+            data = monitor.snapshot(self.manager.directory)
+        self.assertEqual(data['commands'], [])
+        self.assertIsNone(data['worker'])
+        self.assertEqual(self.manager.db.execute('SELECT count(*) FROM queue').fetchone()[0], before)
+        self.assertEqual(state.row(1)['state'], 'queued')
+        missing = self.root / 'absent'
+        with self.assertRaises(sqlite3.OperationalError):
+            monitor.snapshot(missing)
+        self.assertFalse(missing.exists())
+
+    def test_monitor_uses_global_ids_excludes_controls_and_limits_history(self):
+        _, first, _ = self.add_project('one', 1)
+        _, second, _ = self.add_project('two', 2)
+        for _ in range(7):
+            ident = first.enqueue(None, 'start', 'Old work', item=7)
+            first.finish(ident, 'succeeded', 'Done')
+        first.enqueue(None, 'pause', '')
+        first.enqueue(None, 'continue', 'Queued', item=7)
+        second.enqueue(None, 'start', 'Needs reconciliation', item=8)
+        second.finish(1, 'unknown', 'Inspect saved work')
+        self.manager.sync_queue()
+        data = monitor.snapshot(self.manager.directory)
+        rows = data['commands']
+        self.assertEqual(len(rows), 7)
+        self.assertEqual([row['state'] for row in rows[:2]], ['queued', 'unknown'])
+        self.assertEqual(rows[0]['id'], self.manager.ticket(1, 9))
+        self.assertEqual(rows[1]['id'], self.manager.ticket(2, 1))
+        self.assertEqual(rows[1]['repository'], 'example/two')
+        self.assertEqual(rows[1]['task'], '#8')
+        self.assertEqual(len([row for row in rows if row['state'] == 'succeeded']), 5)
+
+    def test_monitor_displays_saved_issue_title_and_bounded_activity_tail(self):
+        _, state, _ = self.add_project('one', 1)
+        self.comment('example/one', 101)
+        self.tick()
+        with state.db:
+            state.db.execute("UPDATE commands SET state='running' WHERE id=1")
+        row = state.row(1)
+        log = state.directory / (row['execution_id'] + '.jsonl')
+        log.write_bytes(b'x' * 100000 + b'\n' + json.dumps({'type': 'item.started', 'item': {
+            'type': 'command_execution', 'command': 'python3 tests/test_manager.py'}}).encode() + b'\n{partial')
+        data = monitor.snapshot(self.manager.directory)
+        self.assertEqual(data['commands'][0]['task'], '#7 Task')
+        self.assertEqual(data['commands'][0]['activity']['text'], 'Polecenie: python3 tests/test_manager.py')
+        self.assertLessEqual(len(monitor.tail(log)[0]), 65536)
+        text = monitor.render(data)
+        self.assertIn('BRAK WORKERA', text)
+        self.assertNotIn('· aktywne: 1', text)
+
+    def test_worker_record_checks_process_birth_and_cleans_up_on_error(self):
+        directory = self.manager.directory
+        with self.assertRaisesRegex(RuntimeError, 'test exit'):
+            with monitor.worker_record(directory, 2):
+                self.assertEqual(monitor.snapshot(directory)['worker']['pid'], os.getpid())
+                saved = json.loads((directory / 'worker.json').read_text())
+                (directory / 'worker.json').write_text(json.dumps(dict(saved, born='wrong birth')))
+                self.assertIsNone(monitor.snapshot(directory)['worker'])
+                raise RuntimeError('test exit')
+        self.assertFalse((directory / 'worker.json').exists())
+
+    def test_run_publishes_worker_identity_for_normal_and_once_runs(self):
+        self.add_project('one', 1)
+        observed = []
+        def tick(fd, background=False):
+            observed.append(monitor.snapshot(self.manager.directory)['worker'])
+            if background:
+                self.manager.request_stop()
+        with patch.object(self.manager, 'tick', side_effect=tick):
+            self.assertEqual(self.manager.run(once=True), 0)
+            self.assertEqual(self.manager.run(), 0)
+        self.assertEqual([row['pid'] for row in observed], [os.getpid(), os.getpid()])
+        self.assertIsNone(monitor.snapshot(self.manager.directory)['worker'])
+
+    def test_monitor_cli_and_run_alias_do_not_construct_manager(self):
+        for option in ('-m', '--monitor'):
+            argv = ['murphy', '--state-dir', str(self.manager.directory), 'run', option, '--once',
+                    '--timeout', '123', '--poll-seconds', '15', '--max-parallel-projects', '1']
+            with patch.object(sys, 'argv', argv), patch.object(cli, 'Manager', side_effect=AssertionError), \
+                    patch.object(monitor, 'run_with_monitor', return_value=2) as run:
+                self.assertEqual(cli.main(), 2)
+            run.assert_called_once_with(str(self.manager.directory),
+                ['--timeout', '123.0', '--max-parallel-projects', '1', '--poll-seconds', '15.0', '--once'])
+        with patch.object(sys, 'argv', ['murphy', 'monitor', '--once']), \
+                patch.object(cli, 'Manager', side_effect=AssertionError), patch.object(monitor, 'watch', return_value=0) as watch:
+            self.assertEqual(cli.main(), 0)
+        watch.assert_called_once_with(None, True)
+
+    def test_monitor_pipe_prints_once_and_leaves_worker_and_queue_untouched(self):
+        self.add_project('one', 1)
+        with monitor.worker_record(self.manager.directory, 1), patch('sys.stdout', new_callable=io.StringIO) as output:
+            self.assertEqual(monitor.watch(self.manager.directory), 0)
+            self.assertIsNotNone(monitor.read_worker(self.manager.directory))
+            self.assertEqual(output.getvalue().count('Murphy ·'), 1)
+            self.assertNotIn('\x1b', output.getvalue())
+        self.assertFalse(self.manager.stop)
+
+    def test_monitor_ctrl_c_restores_terminal_and_does_not_stop_worker(self):
+        self.add_project('one', 1)
+        output = io.StringIO()
+        output.isatty = lambda: True
+        with monitor.worker_record(self.manager.directory, 1), patch('sys.stdout', output), \
+                patch.dict(os.environ, TERM='xterm'), patch.object(monitor.time, 'sleep', side_effect=KeyboardInterrupt):
+            self.assertEqual(monitor.watch(self.manager.directory), 0)
+            self.assertIsNotNone(monitor.read_worker(self.manager.directory))
+        self.assertIn('\x1b[?1049h', output.getvalue())
+        self.assertIn('\x1b[?25h\x1b[?1049l', output.getvalue())
+        self.assertFalse(self.manager.stop)
+
+    def test_run_monitor_forwards_interrupt_waits_and_preserves_diagnostics(self):
+        # A real process stands in for the worker; it acknowledges SIGTERM before exit.
+        source = '''import os,signal,time,sys
+from pathlib import Path
+from murphy.monitor import worker_record
+stopped = False
+def stop(*_):
+    global stopped
+    stopped = True
+signal.signal(signal.SIGTERM, stop)
+with worker_record(Path(sys.argv[1]), 1):
+    print('fictional diagnostic', file=sys.stderr, flush=True)
+    os.kill(int(sys.argv[2]), signal.SIGINT)
+    deadline = time.monotonic() + 10
+    while not stopped and time.monotonic() < deadline:
+        time.sleep(0.02)
+Path(sys.argv[1], 'stopped').write_text(str(stopped))
+'''
+        real_popen = subprocess.Popen
+        children = []
+        def launch(command, **kwargs):
+            self.assertEqual(command, [sys.executable, '-m', 'murphy', '--state-dir', str(self.manager.directory), 'run'])
+            child = real_popen([sys.executable, '-c', source, str(self.manager.directory), str(os.getpid())],
+                               cwd=ROOT, **kwargs)
+            children.append(child)
+            return child
+        previous = signal.getsignal(signal.SIGINT)
+        with patch.object(monitor.subprocess, 'Popen', side_effect=launch), \
+                patch('sys.stdout', new_callable=io.StringIO) as output, patch('sys.stderr', new_callable=io.StringIO) as errors:
+            self.assertEqual(monitor.run_with_monitor(str(self.manager.directory), []), 0)
+        self.assertEqual((self.manager.directory / 'stopped').read_text(), 'True')
+        self.assertIsNotNone(children[0].returncode)
+        self.assertEqual(signal.getsignal(signal.SIGINT), previous)
+        self.assertIn('fictional diagnostic', errors.getvalue())
+        self.assertIn('Zatrzymywanie', output.getvalue())
+
+    def test_monitor_render_handles_parallelism_durations_and_terminal_input(self):
+        data = {'worker': {'parallel': 2}, 'paused': False, 'observed': 1000, 'commands': [
+            {'id': 1, 'repository': 'example/one', 'task': '#7 Task\x1b[2J\nnew line', 'state': 'running',
+             'started': '1970-01-01T00:15:00+00:00', 'finished': None,
+             'detail': '', 'activity': {'text': 'Checking files', 'updated': 990}},
+            {'id': 2, 'repository': 'example/two', 'task': '#8 Task', 'state': 'succeeded',
+             'started': '1970-01-01T00:10:00+00:00', 'finished': '1970-01-01T00:11:00+00:00',
+             'detail': '', 'activity': None}]}
+        text = monitor.render(data, 100)
+        header, first = text.splitlines()[3:5]
+        self.assertEqual(header.index('REPO'), first.index('example/one'))
+        self.assertEqual(header.index('STATUS'), first.index('PRACUJE'))
+        self.assertIn('aktywne: 1/2', text)
+        self.assertIn('01:40', text)
+        self.assertIn('01:00', text)
+        self.assertIn('Log: 10 s temu', text)
+        self.assertNotIn('\x1b', text)
+        data['observed'] += 50
+        self.assertIn('01:00', monitor.render(data))  # A finished duration stays fixed.
+        for width in (20, 60, 80, 100):
+            self.assertTrue(all(len(line) <= width for line in monitor.render(data, width).splitlines()))
+        self.assertIn('…', monitor.fit('Very long task title', 8))
+        self.assertEqual(monitor.fit('猫', 2), '猫')
+        data['paused'] = True
+        self.assertIn('PAUZA', monitor.render(data))
+
+    def test_run_monitor_drains_a_real_manager_and_model_double(self):
+        _, state, _ = self.add_project('one', 1)
+        self.comment('example/one', 101, 'WAIT_FOR_TEST_RELEASE DAEMON_FOREVER')
+        self.manager.pump()  # Persist the command without starting it.
+        payload = {'user': self.user, 'executor': self.executor, 'repos': self.repos, 'comments': self.comments}
+        fixture = self.root / 'fixture.json'
+        fixture.write_text(json.dumps(payload))
+        source = '''import json,os,sys,time
+from pathlib import Path
+from unittest.mock import patch
+sys.path.insert(0, 'tests')
+from test_manager import ManagerTests,Account,Manager,b
+case = ManagerTests()
+for key,value in json.loads(Path(sys.argv[2]).read_text()).items():
+    setattr(case,key,value)
+case.reported = []
+real_git = b.git
+with patch.object(Account,'api',lambda account,*a,**kw: case.account_api(account,*a,**kw)), \\
+     patch.object(b.GitHub,'api',lambda github,*a,**kw: case.github_api(*a,**kw)), \\
+     patch.object(b,'git',lambda cwd,*args: '' if args[0]=='fetch' else real_git(cwd,*args)):
+    manager = Manager(sys.argv[1])
+    manager.timeout = 5
+    original = manager.tick
+    sent = False
+    deadline = time.monotonic() + 12
+    def tick(fd,background=False):
+        global sent
+        original(fd,background)
+        for _,state,_ in manager.projects.values():
+            for task in state.db.execute('SELECT cwd FROM tasks'):
+                if not sent and Path(task['cwd'],'execution-started').exists():
+                    sent = True
+                    os.kill(int(sys.argv[3]),signal.SIGINT)
+        if time.monotonic() > deadline:
+            manager.request_stop()
+    import signal
+    manager.tick = tick
+    try:
+        result = manager.run()
+    finally:
+        manager.close()
+    sys.exit(result)
+'''
+        real_popen = subprocess.Popen
+        def launch(command, **kwargs):
+            return real_popen([sys.executable, '-c', source, str(self.manager.directory), str(fixture), str(os.getpid())],
+                              cwd=ROOT, **kwargs)
+        with patch.object(monitor.subprocess, 'Popen', side_effect=launch), \
+                patch('sys.stdout', new_callable=io.StringIO), patch('sys.stderr', new_callable=io.StringIO) as errors:
+            self.assertEqual(monitor.run_with_monitor(str(self.manager.directory), []), 0, errors.getvalue())
+        self.assertEqual(state.row(1)['state'], 'cancelled')
+        model_pid = int((self.task_path(state) / 'execution-started').read_text())
+        self.assertIsNone(monitor.process_birth(model_pid))
+        self.assertIsNone(monitor.read_worker(self.manager.directory))
+
+    def test_run_monitor_preserves_failure_exit_status(self):
+        real_popen = subprocess.Popen
+        def launch(command, **kwargs):
+            return real_popen([sys.executable, '-c', "import sys; print('failed turn',file=sys.stderr); sys.exit(2)"], **kwargs)
+        with patch.object(monitor.subprocess, 'Popen', side_effect=launch), \
+                patch('sys.stdout', new_callable=io.StringIO), patch('sys.stderr', new_callable=io.StringIO) as errors:
+            self.assertEqual(monitor.run_with_monitor(str(self.manager.directory), []), 2)
+        self.assertIn('failed turn', errors.getvalue())
 
     def test_project_polling_obeys_independent_intervals(self):
         self.add_project('one', 1, interval=20)
