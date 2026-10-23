@@ -721,6 +721,7 @@ class ManagerTests(unittest.TestCase):
             self.assertLessEqual(len(text.splitlines()), height)
             self.assertTrue(all(len(line) <= width for line in text.splitlines()))
             self.assertIn('Codex:', text.splitlines()[-1])
+            self.assertTrue(any('Ctrl+C' in line for line in text.splitlines()[-2:]))
             self.assertIn('example/one', text)
         self.assertEqual(monitor.fit('Bikeparks-pl/bikeparks2', 12), 'Bikeparks-p…')
         self.assertEqual(monitor.fit('猫猫猫', 5), '猫猫…')
@@ -785,7 +786,12 @@ class ManagerTests(unittest.TestCase):
         for width, height in ((20, 8), (60, 12), (100, 24)):
             text = monitor.render(data, width, height)
             self.assertIn('Codex: 5h 1%', text.splitlines()[-1])
+            self.assertTrue(any('Ctrl+C' in line for line in text.splitlines()[-2:]))
             self.assertLessEqual(len(text.splitlines()), height)
+        for footer in ('Ctrl+C — zamknij podgląd (worker pracuje dalej)', 'Ctrl+C — zatrzymaj Murphy’ego'):
+            lines = monitor.render(data, 20, 8, footer=footer).splitlines()
+            self.assertEqual(lines[-2], monitor.fit(footer, 20).rstrip())
+            self.assertIn('Codex: 5h 1%', lines[-1])
         for invalid in (None, {}, {'primary': {'usedPercent': None, 'windowDurationMins': 300}},
                         {'primary': {'usedPercent': -1, 'windowDurationMins': 300}},
                         {'primary': {'usedPercent': True, 'windowDurationMins': 300}}):

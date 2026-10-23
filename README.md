@@ -238,7 +238,8 @@ and unknown commands show their saved explanation. Long text is shortened to fit
 narrow terminals use two lines per task. The monitor makes no model calls or GitHub requests.
 
 The last line shows Codex account quota **usage** percentages for the available windows
-(for example `Codex: 5h 25% · 7d 81% zużycia`), followed by the keyboard shortcut. The monitor
+(for example `Codex: 5h 25% · 7d 81% zużycia`), followed by the keyboard shortcut. In narrow
+terminals the shortcut moves above the quota line so it stays visible. The monitor
 uses the installation's saved Codex executable and its existing login to read
 [`account/rateLimits/read`](https://learn.chatgpt.com/docs/app-server#auth-endpoints).
 This account-wide usage includes work outside Murphy. A background read runs at most once

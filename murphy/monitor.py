@@ -310,7 +310,10 @@ def render(data, width=100, height=24, footer='Ctrl+C — zamknij podgląd'):
     bottom = []
     if data.get('diagnostic'):
         bottom.append('Worker: ' + data['diagnostic'])
-    bottom.extend(['', usage_label(data.get('codex_limits')) + (' · ' + footer if footer else '')])
+    usage = usage_label(data.get('codex_limits'))
+    combined = usage + (' · ' + footer if footer else '')
+    # Keep the interrupt hint visible when the quota line fills a narrow terminal.
+    bottom.extend([footer, usage] if footer and len(clean(combined)) > width else ['', combined])
     id_width = max(2, max((len(str(row['id'])) for row in rows), default=2))
     repo_width = min(28, max(10, max((len(row['repository']) for row in rows), default=10)), max(10, width // 4))
     status_width = max(6, max((len(LABELS.get(row['state'], row['state'])) for row in rows), default=6))
