@@ -531,7 +531,8 @@ def codex_home():
 
 def git(cwd, *args):
     return subprocess.check_output([CONFIG.git, '-C', cwd, *args], text=True, stderr=subprocess.PIPE,
-                                   env=environment(CONFIG)).strip()
+                                   env=environment(CONFIG),
+                                   umask=0o022 if args[:2] == ('worktree', 'add') else -1).strip()
 
 
 def dirty_summary(cwd):
@@ -965,7 +966,7 @@ class Worker:
         started = time.monotonic()
         with open(log_path, 'wb') as log, open(err_path, 'wb') as errors:
             child = subprocess.Popen(args, cwd=task['cwd'], env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=errors, start_new_session=True, pass_fds=(fd,))
+                                     stderr=errors, start_new_session=True, pass_fds=(fd,), umask=0o022)
             with self.state.db:
                 self.state.db.execute('UPDATE commands SET pid=? WHERE id=?', (child.pid, row['id']))
             selector = selectors.DefaultSelector()

@@ -43,6 +43,9 @@ def emit(kind, **data):
 
 emit('thread.started', thread_id=thread, argv=sys.argv, prompt=prompt)
 emit('turn.started', turn_id=str(uuid.uuid4()))
+if 'CHECK_WORKSPACE_MODES' in prompt:
+    Path('runtime-directory').mkdir(exist_ok=True)
+    Path('runtime-directory/file.txt').write_text('readable by application containers')
 if 'LEAVE_SSH_SOCKET' in prompt:
     import socket
     import tomllib
