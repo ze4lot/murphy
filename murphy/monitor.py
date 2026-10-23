@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import contextlib
+import concurrent.futures
 import datetime as dt
 import json
 import os
 from pathlib import Path
+import select
 import shutil
 import signal
 import sqlite3
@@ -21,6 +23,102 @@ LABELS = {'queued': 'W KOLEJCE', 'running': 'PRACUJE', 'waiting_for_user': 'CZEK
           'cancelled': 'ANULOWANE', 'unknown': 'WYNIK NIEZNANY'}
 PENDING = ('queued', 'running', 'waiting_for_user', 'blocked', 'unknown')
 ALWAYS_VISIBLE = ('queued', 'running', 'blocked', 'unknown')
+
+
+def read_codex_limits(executable, timeout=5):
+    """Read account metadata only; never create a Codex session or invoke a model."""
+    with subprocess.Popen([executable, 'app-server'], stdin=subprocess.PIPE,
+                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as process:
+        def send(message):
+            process.stdin.write((json.dumps(message) + '\n').encode())
+            process.stdin.flush()
+
+        deadline, buffer = time.monotonic() + timeout, b''
+        try:
+            send({'id': 1, 'method': 'initialize', 'params': {
+                'clientInfo': {'name': 'murphy_monitor', 'version': '0.1.0'}}})
+            while time.monotonic() < deadline:
+                if not select.select([process.stdout], [], [], max(0, deadline - time.monotonic()))[0]:
+                    break
+                chunk = os.read(process.stdout.fileno(), 65536)
+                if not chunk:
+                    break
+                buffer += chunk
+                if len(buffer) > 1048576:
+                    break
+                while b'\n' in buffer:
+                    line, buffer = buffer.split(b'\n', 1)
+                    message = json.loads(line)
+                    if message.get('error'):
+                        return None
+                    if message.get('id') == 1:
+                        send({'method': 'initialized'})
+                        send({'id': 2, 'method': 'account/rateLimits/read'})
+                    elif message.get('id') == 2:
+                        result = message['result']
+                        buckets = result.get('rateLimitsByLimitId')
+                        return buckets.get('codex') if buckets else result.get('rateLimits')
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            return None
+        finally:
+            # Only this monitor's metadata helper is stopped, never an executor/worker.
+            if process.poll() is None:
+                process.terminate()
+            try:
+                process.wait(timeout=0.2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+    return None
+
+
+class CodexUsage:
+    """Refresh off the rendering loop; snapshots themselves remain read-only/local."""
+    def __init__(self, directory):
+        self.directory = state_directory(directory)
+        self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self.future = None
+        self.next_refresh = 0
+        self.value = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.pool.shutdown(wait=True)
+
+    def read(self, wait=False):
+        if self.future is None and time.monotonic() >= self.next_refresh:
+            self.next_refresh = time.monotonic() + 60
+            try:
+                with database(self.directory / 'manager.sqlite') as connection:
+                    saved = connection.execute("SELECT value FROM settings WHERE key='account'").fetchone()
+                executable = json.loads(saved[0])['codex'] if saved else 'codex'
+                self.future = self.pool.submit(read_codex_limits, executable)
+            except (OSError, sqlite3.Error, ValueError, KeyError, TypeError):
+                self.value = None
+        if self.future is not None and (wait or self.future.done()):
+            try:
+                self.value = self.future.result()
+            except (OSError, ValueError, KeyError, TypeError):
+                self.value = None
+            self.future = None
+        return self.value
+
+
+def usage_label(limits):
+    windows = []
+    for key in ('primary', 'secondary'):
+        window = limits.get(key) if isinstance(limits, dict) else None
+        if not isinstance(window, dict):
+            continue
+        used, minutes = window.get('usedPercent'), window.get('windowDurationMins')
+        if (isinstance(used, bool) or not isinstance(used, (int, float)) or not 0 <= used <= 100
+                or isinstance(minutes, bool) or not isinstance(minutes, int) or minutes <= 0):
+            continue
+        period = f'{minutes // 1440}d' if minutes % 1440 == 0 else f'{minutes // 60}h' if minutes % 60 == 0 else f'{minutes}m'
+        windows.append(f'{period} {used:g}%')
+    return 'Codex: ' + (' · '.join(windows) + ' zużycia' if windows else 'brak danych')
 
 
 def task_commands(connection):
@@ -207,14 +305,12 @@ def render(data, width=100, height=24, footer='Ctrl+C — zamknij podgląd'):
     state = 'WYŁĄCZONY' if not worker else 'PAUZA' if data['paused'] else 'PRACUJE' if active else 'BEZCZYNNY'
     state = data.get('phase') or state
     slots = f'/{worker["parallel"]}' if worker else ''
-    lines = [f'Murphy · {state} · aktywne: {active}{slots} · w kolejce: {queued}',
+    lines = [f'Murphy · {state} · aktywne: {active}{slots} · w kolejce: {queued} · zakończone: {data.get("hidden_closed", 0)}',
              'Odświeżono: ' + dt.datetime.fromtimestamp(observed).strftime('%H:%M:%S'), '']
     bottom = []
-    if data.get('hidden_closed'):
-        bottom.append(f'Ukryto zamknięte/usunięte w GitHub: {data["hidden_closed"]}')
     if data.get('diagnostic'):
         bottom.append('Worker: ' + data['diagnostic'])
-    bottom.extend(['', footer])
+    bottom.extend(['', usage_label(data.get('codex_limits')) + (' · ' + footer if footer else '')])
     id_width = max(2, max((len(str(row['id'])) for row in rows), default=2))
     repo_width = min(28, max(10, max((len(row['repository']) for row in rows), default=10)), max(10, width // 4))
     status_width = max(6, max((len(LABELS.get(row['state'], row['state'])) for row in rows), default=6))
@@ -269,7 +365,8 @@ class Terminal:
         text = render(data, size.columns, max(1, size.lines - 1), self.footer)
         # Pipes get state changes, without ANSI escapes or a new timer line every second.
         signature = [(row['id'], row['state'], row['activity']) for row in data['commands']]
-        signature = (data['worker'], data['paused'], signature, data.get('diagnostic'), data.get('phase'), data.get('hidden_closed'))
+        signature = (data['worker'], data['paused'], signature, data.get('diagnostic'), data.get('phase'),
+                     data.get('hidden_closed'), data.get('codex_limits'))
         if self.tty or signature != self.previous:
             print(('\x1b[H\x1b[2J' if self.tty else '') + text, flush=True)
         self.previous, self.last = signature, data
@@ -288,9 +385,11 @@ def watch(directory=None, once=False):
 
     previous = signal.signal(signal.SIGTERM, stop)
     try:
-        with Terminal('Ctrl+C — zamknij podgląd (worker pracuje dalej)') as terminal:
+        with CodexUsage(directory) as usage, Terminal('Ctrl+C — zamknij podgląd (worker pracuje dalej)') as terminal:
             while True:
-                terminal.draw(snapshot(directory))
+                data = snapshot(directory)
+                data['codex_limits'] = usage.read(wait=once or not terminal.tty)
+                terminal.draw(data)
                 if once or not terminal.tty:
                     return 0
                 time.sleep(1)
@@ -317,7 +416,7 @@ def run_with_monitor(directory, options):
         with tempfile.TemporaryFile() as output:
             process = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
             try:
-                with Terminal('Ctrl+C — zatrzymaj Murphy’ego') as terminal:
+                with CodexUsage(directory) as usage, Terminal('Ctrl+C — zatrzymaj Murphy’ego') as terminal:
                     sent_stop = False
                     while True:
                         result = process.poll()
@@ -341,6 +440,7 @@ def run_with_monitor(directory, options):
                         if sent_stop:
                             data['phase'] = 'ZATRZYMYWANIE' if result is None else None
                             data['diagnostic'] = 'Zatrzymywanie workera i jego procesów…' if result is None else 'Worker zatrzymany.'
+                        data['codex_limits'] = usage.read()
                         terminal.draw(data)
                         if result is not None:
                             break

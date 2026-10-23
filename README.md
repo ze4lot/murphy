@@ -226,7 +226,8 @@ continuation completes. Queued, running, blocked and unknown commands always rem
 even if a later turn exists. Active and unresolved commands appear first, followed by up to five
 recent completions. Local commands show their task name. A queued issue's title may be unavailable
 until the worker fetches it. Pause/resume/cancel control commands are omitted.
-The header distinguishes an idle, busy, paused or stopped worker and shows active/queued counts.
+The header distinguishes an idle, busy, paused or stopped worker and shows active/queued counts,
+followed by `zakończone`: the number of closed/merged/deleted items hidden from the table.
 An old `running` row without its coordinator is displayed as `BRAK WORKERA`, not as live work;
 the monitor does not reconcile it or change the recorded outcome.
 
@@ -235,6 +236,15 @@ tail of its existing execution JSONL. `Log: N s temu` measures the last log writ
 duration of the displayed action. Silence is not treated as a hang. Waiting, blocked, failed
 and unknown commands show their saved explanation. Long text is shortened to fit the terminal;
 narrow terminals use two lines per task. The monitor makes no model calls or GitHub requests.
+
+The last line shows Codex account quota **usage** percentages for the available windows
+(for example `Codex: 5h 25% · 7d 81% zużycia`), followed by the keyboard shortcut. The monitor
+uses the installation's saved Codex executable and its existing login to read
+[`account/rateLimits/read`](https://learn.chatgpt.com/docs/app-server#auth-endpoints).
+This account-wide usage includes work outside Murphy. A background read runs at most once
+per minute without holding up task rendering; `monitor --once` waits up to five seconds for
+its initial read. Missing login, unavailable service or unsupported CLI shows `Codex: brak danych`
+instead of a percentage. This helper creates no model turns and never resets any quota.
 
 The worker refreshes a local issue/PR status cache with at most one GraphQL batch (up to 50
 distinct inactive items) per repository every five minutes. Recently checked items are skipped
@@ -251,7 +261,7 @@ then follow the same five-minute batch interval, so old unresolved entries can b
 immediately after upgrading.
 
 Closed issues, closed/merged PRs and confirmed deleted items disappear from the default view,
-with a hidden-item count.
+with their count shown as `zakończone` in the header.
 This is presentation only: commands, reports, worktrees and sessions are retained, and
 `murphy status` still includes the full command history. Queued/running commands and blocked or
 unknown outcomes are never hidden or automatically resolved by this cache. Closure is based
