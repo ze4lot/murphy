@@ -950,6 +950,31 @@ class BridgeTests(unittest.TestCase):
                 self.assertNotIn('Changed after the start.', event['prompt'])
         self.assertEqual(self.state.ingest(list(self.api.data.values())), [])
 
+    def test_private_worker_creates_container_readable_worktree_and_executor_files(self):
+        (self.cwd / 'public').mkdir()
+        (self.cwd / 'public/index.txt').write_text('tracked source')
+        b.git(str(self.cwd), 'add', 'public/index.txt')
+        b.git(str(self.cwd), '-c', 'user.name=Test Bot', '-c', 'user.email=bot@example.invalid',
+              'commit', '-qm', 'source fixture')
+        fetch = self.setup_autostart(body='CHECK_WORKSPACE_MODES')
+        self.api.data = {101: comment(101, item=500)}
+        ident = self.state.ingest(list(self.api.data.values()))[0]
+        previous = os.umask(0o077)
+        try:
+            with fetch:
+                self.execute()
+            self.assertEqual(os.umask(0o077), 0o077)
+        finally:
+            os.umask(previous)
+        self.assertEqual(self.state.row(ident)['state'], 'succeeded')
+        cwd = Path(self.temp.name) / 'automatic/issue-500'
+        for path in (cwd, cwd / 'public', cwd / 'runtime-directory'):
+            self.assertEqual(path.stat().st_mode & 0o777, 0o755)
+        for path in (cwd / 'public/index.txt', cwd / 'runtime-directory/file.txt'):
+            self.assertEqual(path.stat().st_mode & 0o777, 0o644)
+        for path in self.state.directory.glob('*.jsonl'):
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
     def test_dirty_source_blocks_before_fetch_and_requires_explicit_resume(self):
         fetch = self.setup_autostart()
         dirty = self.cwd / 'private draft.txt'

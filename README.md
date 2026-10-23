@@ -104,6 +104,8 @@ murphy projects list
 
 The source checkout is not switched, cleaned, reset or copied. Task worktrees live outside it. A managed clone failure preserves partial files; inspect them and explicitly use `--checkout` after fixing the problem. Connecting a repository twice fails without moving its activation boundary. An empty repository needs an initial commit before connection. A non-default task base must already exist on the remote.
 
+New automatic worktrees and executor processes use a `022` umask so application containers can read source files (normally `644`) and traverse workspace directories (normally `755`). Installation state and execution logs retain the worker's private `077` umask. Existing workspaces are not recursively chmodded; repository-specific credentials and secrets must keep their own restrictive permissions. Container networks, ports and test data isolation belong to the target repository's QA workflow, not Murphy.
+
 Choose external tool wrappers once, if needed:
 
 ```bash
