@@ -440,6 +440,7 @@ class Manager:
         from .cleanup import automatic_tasks, retire
         clock, checked = time.monotonic(), time.time()
         for project, (config, state, worker) in self.projects.items():
+            first_refresh = project not in self.last_issue_check
             if clock - self.last_issue_check.get(project, float('-inf')) < 300:
                 continue
             self.last_issue_check[project] = clock  # Failures back off too.
@@ -448,7 +449,7 @@ class Manager:
             for task, _ in automatic_tasks(state):
                 for alias in state.db.execute('SELECT number FROM items WHERE task=?', (task['name'],)):
                     saved = cache.get(str(alias[0]), {})
-                    if checked - saved.get('attempted', 0) >= 300:
+                    if first_refresh or checked - saved.get('attempted', 0) >= 300:
                         numbers.add(alias[0])
             for row in task_commands(state.db):
                 if not row['item'] or row['state'] in ALWAYS_VISIBLE:

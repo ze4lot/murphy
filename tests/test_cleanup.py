@@ -67,6 +67,9 @@ class CleanupTests(unittest.TestCase):
         inventory = patch.object(c, 'container_plan', return_value=[])
         self.container_plan = inventory.start()
         self.addCleanup(inventory.stop)
+        permissions = patch.object(c, 'repair_permissions')
+        self.repair_permissions = permissions.start()
+        self.addCleanup(permissions.stop)
 
     def run_git(self, *args):
         subprocess.run(['git', *args], check=True, capture_output=True)
@@ -567,6 +570,51 @@ class ContainerTests(unittest.TestCase):
                 self.real_runtime_call(['docker', '--host', 'unix:///fixture.sock'], 'container', 'rm', 'task')
             self.assertEqual(run.call_args.kwargs['timeout'], 25)
             self.assertNotIn('DOCKER_CONTEXT', run.call_args.kwargs['env'])
+
+
+class PermissionRepairTests(unittest.TestCase):
+    def test_writable_task_does_not_start_helper(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(c, 'runtime_call') as run:
+            c.repair_permissions(directory)
+            run.assert_not_called()
+
+    def test_helper_mounts_only_task_without_submounts_and_preserves_symlink_targets(self):
+        with tempfile.TemporaryDirectory(prefix='task, with spaces ') as directory:
+            restricted = Path(directory) / 'build'
+            restricted.mkdir(mode=0o500)
+            try:
+                def run(runtime, *args):
+                    if args[0] == 'context':
+                        return json.dumps('unix:///fixture.sock')
+                    self.assertEqual(args[0], 'run')
+                    self.assertIn('--rm', args)
+                    self.assertIn('--network=none', args)
+                    self.assertIn('--read-only', args)
+                    self.assertIn('--cap-drop=ALL', args)
+                    fields = next(c.csv.reader([args[args.index('--mount') + 1]]))
+                    self.assertEqual(fields, ['type=bind', 'source=' + directory,
+                                             'target=/worktree', 'bind-recursive=disabled'])
+                    self.assertIn('chown -hR "$1"', args[-3])
+                    self.assertEqual(args[-1], str(os.getuid()) + ':' + str(os.getgid()))
+                    restricted.chmod(0o700)
+                    return ''
+                with patch.object(c.shutil, 'which', return_value='docker'), \
+                        patch.object(c, 'runtime_call', side_effect=run):
+                    c.repair_permissions(directory)
+                self.assertTrue(c.writable_directories(directory))
+            finally:
+                restricted.chmod(0o700)
+
+    def test_missing_runtime_or_unsuccessful_repair_does_not_claim_success(self):
+        with patch.object(c, 'writable_directories', return_value=False):
+            with patch.object(c.shutil, 'which', return_value=None):
+                with self.assertRaisesRegex(ValueError, 'require local Docker'):
+                    c.repair_permissions('/tmp/task')
+            with patch.object(c.shutil, 'which', return_value='docker'), \
+                    patch.object(c, 'docker_runtime', return_value=['docker']), \
+                    patch.object(c, 'runtime_call', return_value=''):
+                with self.assertRaisesRegex(ValueError, 'remain inaccessible'):
+                    c.repair_permissions('/tmp/task')
 
 
 if __name__ == '__main__':

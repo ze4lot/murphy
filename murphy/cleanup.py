@@ -1,5 +1,7 @@
 """Retire closed tasks through Git, under the coordinator lock."""
 import json
+import csv
+import io
 import os
 from pathlib import Path
 import shutil
@@ -70,6 +72,50 @@ def task_path(value, cwd):
     return path == root or root in path.parents
 
 
+def docker_runtime(executable):
+    context = os.environ.get('DOCKER_CONTEXT')
+    endpoint = os.environ.get('DOCKER_HOST') if not context else None
+    if not endpoint:
+        endpoint = json.loads(runtime_call([executable], 'context', 'inspect',
+            *([context] if context else []), '--format', '{{json .Endpoints.docker.Host}}'))
+    if not isinstance(endpoint, str) or not endpoint.startswith('unix://'):
+        raise ValueError('Task container cleanup requires a local Docker endpoint')
+    return [executable, '--host', endpoint]
+
+
+def writable_directories(cwd):
+    def inaccessible(error):
+        raise error
+    try:
+        for directory, _, _ in os.walk(cwd, onerror=inaccessible, followlinks=False):
+            if not os.access(directory, os.R_OK | os.W_OK | os.X_OK):
+                return False
+    except PermissionError:
+        return False
+    return True
+
+
+def repair_permissions(cwd):
+    """Repair container-created directories through a single task-only bind mount."""
+    if writable_directories(cwd):
+        return
+    executable = shutil.which('docker')
+    if not executable:
+        raise ValueError('Container-owned task files require local Docker for ownership repair')
+    runtime = docker_runtime(executable)
+    mount = io.StringIO()
+    csv.writer(mount, lineterminator='').writerow([
+        'type=bind', 'source=' + cwd, 'target=/worktree', 'bind-recursive=disabled'])
+    runtime_call(runtime, 'run', '--rm', '--pull=missing', '--network=none', '--read-only',
+                 '--user=0', '--cap-drop=ALL', '--cap-add=CHOWN', '--cap-add=DAC_OVERRIDE',
+                 '--cap-add=FOWNER', '--security-opt=no-new-privileges', '--label', TASK_LABEL + '=' + cwd,
+                 '--mount', mount.getvalue(), '--entrypoint=/bin/sh', 'alpine:3.22', '-ec',
+                 'chown -hR "$1" /worktree; find /worktree -xdev -type d -exec chmod u+rwx {} +',
+                 '--', str(os.getuid()) + ':' + str(os.getgid()))
+    if not writable_directories(cwd):
+        raise ValueError('Task directories remain inaccessible after container ownership repair')
+
+
 def container_plan(cwd):
     """Inventory only task-owned local containers and their private resources."""
     plans = []
@@ -84,14 +130,7 @@ def container_plan(cwd):
                 raise ValueError(name + ' runtime detected but cleanup CLI is unavailable')
             continue
         if name == 'docker':
-            context = os.environ.get('DOCKER_CONTEXT')
-            endpoint = os.environ.get('DOCKER_HOST') if not context else None
-            if not endpoint:
-                endpoint = json.loads(runtime_call([executable], 'context', 'inspect',
-                    *([context] if context else []), '--format', '{{json .Endpoints.docker.Host}}'))
-            if not isinstance(endpoint, str) or not endpoint.startswith('unix://'):
-                raise ValueError('Task container cleanup requires a local Docker endpoint')
-            runtime = [executable, '--host', endpoint]
+            runtime = docker_runtime(executable)
         else:
             runtime = [executable, '--remote=false']
         ids = runtime_call(runtime, 'ps', '-aq', '--no-trunc').split()
@@ -280,6 +319,8 @@ def retire(state, github, updates, attempted):
                     raise ValueError('Worktree changed or reappeared during cleanup checks')
                 removal_started = True
                 remove_containers(resources)
+                if before is not None:
+                    repair_permissions(task['cwd'])
                 if container_plan(task['cwd']):
                     raise ValueError('Task container resources remain after cleanup')
                 if before is not None:

@@ -707,6 +707,29 @@ class ManagerTests(unittest.TestCase):
                 repeated.assert_not_called()
         self.assertTrue(all(row[0] == 'waiting_for_user' for row in state.db.execute('SELECT state FROM commands')))
 
+    def test_startup_cleanup_rechecks_recent_cache_and_previous_cleanup_failure(self):
+        _, state, worker = self.add_project('one', 1)
+        self.manager.register('example/one', 'manual', self.root / 'one', 'main', [7, 8])
+        ident = state.enqueue('manual', 'start', 'Work', item=7)
+        state.finish(ident, 'succeeded', 'Done')
+        with state.db:
+            state.db.execute('UPDATE tasks SET automatic_json=?,cleanup_json=?',
+                             ('{"proof":"fixture"}', json.dumps(dict(state='blocked', reason='old process error'))))
+            state.set('monitor_issues', json.dumps({str(number): dict(state='CLOSED', checked=9999, attempted=9999)
+                                                  for number in (7, 8)}))
+        fresh = {str(number): {'state': 'CLOSED'} for number in (7, 8)}
+        with patch.object(worker.github, 'issue_states', return_value=fresh) as api, \
+                patch.object(cleanup, 'retire') as retire, \
+                patch('murphy.manager.time.monotonic', return_value=0), \
+                patch('murphy.manager.time.time', return_value=10000):
+            self.manager.refresh_issue_states()
+            self.assertEqual(api.call_args.args[0], [7, 8])
+            self.assertEqual(retire.call_args.args[2:], (fresh, [7, 8]))
+            self.manager.refresh_issue_states()
+            self.assertEqual(api.call_count, 1)
+            self.assertEqual(retire.call_count, 1)
+        self.assertEqual(state.row(ident)['state'], 'succeeded')
+
     def test_issue_status_failures_back_off_and_retain_cache(self):
         _, state, worker = self.add_project('one', 1)
         state.enqueue(None, 'start', 'Task', item=7)

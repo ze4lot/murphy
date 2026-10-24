@@ -305,7 +305,9 @@ Resolution changes bookkeeping only. A branch/worktree creation plan is persiste
 ### Automatic worktree cleanup
 
 The coordinator evaluates automatic task worktrees during the existing five-minute GitHub
-refresh, under its worker lock. All registered aliases must have fresh, explicit states in
+refresh, under its worker lock. The first refresh after startup rechecks automatic tasks
+immediately, even when a previous worker left a recent status cache or cleanup error.
+All registered aliases must have fresh, explicit states in
 that refresh; cached closure, missing responses, HTTP 404/410 and API errors cannot authorize
 removal. A closed original issue or merged PR qualifies a task. A merged PR may qualify its
 still-open original issue, but another open alias or branch PR blocks cleanup. Related PRs
@@ -346,6 +348,12 @@ keeps the directory and reports the error instead of marking cleanup successful.
 resource plan is persisted before mutation. Interrupted or uncertain removals need explicit
 reconciliation. Already absent worktrees still have their attributable containers cleaned.
 A final inventory must confirm no task resources remain before recording success.
+Container-created directories owned by root are repaired before Git removal, when needed,
+using an ephemeral local Docker `alpine:3.22` helper (pulled if missing). Its only host bind
+is the validated task directory, with recursive submounts disabled; its root filesystem is
+read-only and network disabled. It restores directory access and ownership without following
+symlinks. The helper removes itself on exit. Failure preserves the worktree and reconciliation
+state rather than claiming successful deletion.
 
 Removal keeps the local task branch and its commits, including commits not on a remote
 branch, plus reports, logs, history and session metadata. Worktree removal never uses
