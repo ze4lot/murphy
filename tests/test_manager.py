@@ -625,12 +625,15 @@ class ManagerTests(unittest.TestCase):
         with state.db:
             state.set('monitor_issues', json.dumps({'7': {'state': 'CLOSED', 'checked': 1}}))
             state.db.execute('UPDATE tasks SET cleanup_json=?',
-                             (json.dumps({'state': 'blocked', 'reason': 'docker container mounts worktree'}),))
+                             (json.dumps({'state': 'blocked', 'reason': 'git worktree remove failed'}),))
         self.manager.sync_queue()
         snapshot = monitor.snapshot(self.manager.directory)
         self.assertEqual(len(snapshot['commands']), 1)
         self.assertEqual(snapshot['hidden_closed'], 0)
-        self.assertIn('docker container mounts worktree', monitor.render(snapshot, width=120, height=30))
+        rendered = monitor.render(snapshot, width=120, height=30)
+        self.assertIn('ZAKOŃCZONE', rendered)
+        self.assertIn('Sprzątanie: git worktree remove failed', rendered)
+        self.assertNotIn('CLEANUP', rendered)
         self.assertEqual(state.row(ident)['detail'], 'Preserved report')
         self.assertEqual(json.loads(self.manager.status()['tasks'][0]['cleanup_json'])['state'], 'blocked')
 
@@ -649,7 +652,7 @@ class ManagerTests(unittest.TestCase):
                 snapshot = monitor.snapshot(self.manager.directory)
                 self.assertEqual(len(snapshot['commands']), 1 if status == 'removing' else 0)
                 if status == 'removing':
-                    self.assertIn('CLEANUP', monitor.render(snapshot, width=120, height=30))
+                    self.assertIn('Sprzątanie:', monitor.render(snapshot, width=120, height=30))
                 self.assertEqual(state.row(ident)['state'], 'succeeded')
                 self.assertEqual(state.row(ident)['detail'], 'Preserved report')
 

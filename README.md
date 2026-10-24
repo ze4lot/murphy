@@ -319,42 +319,23 @@ are excluded. Git must still confirm the saved source, branch, common directory,
 directory and worktree registration immediately before removal.
 
 Queued/running/blocked commands, queued continuations and unresolved `unknown` outcomes
-prevent cleanup. Staged, unstaged and untracked work also blocks it. A fresh origin fetch
-and remote branch advertisement must prove that HEAD and its ancestors remain on a remote
-branch; stale tracking refs do not suffice. Squash merges followed by branch deletion may
-therefore require operator inspection even when the code was merged.
+prevent cleanup. Staged, unstaged and untracked work also blocks it. After fresh GitHub
+closure/merge and worktree identity checks, Murphy runs ordinary `git worktree remove`.
+It does not scan `/proc`, systemd or Docker/Podman, fetch branches, or require remote
+ancestry proof. Closing/merging the task is the cleanup decision; process visibility,
+container availability, squash merges and deleted remote branches do not veto it.
 
-Murphy checks Linux process working directories, roots, open files, memory maps and command
-lines, plus Docker/Podman container mounts (including stopped containers that could restart).
-Process inspection runs with ordinary worker permissions. Every visible process with the
-worker's UID in any of its real/effective/saved/filesystem UID fields must be inspectable;
-permission errors block removal, including setuid or non-dumpable processes of this user.
-Missing or unreadable UID information or command lines also blocks removal. Visible path
-references from any UID block removal. PID birth time and UIDs are rechecked to detect
-identity changes during inspection.
-
-Protected cwd/root/file-descriptor/map information for a confirmed different UID (commonly
-root's PID 1) is outside the unprivileged inspection guarantee. Murphy continues checking
-other available information and processes, and records those protected PIDs in the durable
-cleanup reason after removal. This is not evidence that those processes are unused: Linux
-[ptrace permissions](https://man7.org/linux/man-pages/man5/proc_pid_cwd.5.html) prevent an
-ordinary worker from proving that. The guarantee covers visible worker-UID processes and
-containers accessible through the detected local runtimes, not arbitrary privileged or
-other-user services, hidden PID namespaces or services that conceal path references.
-Operators must keep worktree consumers under the worker UID or an inspected local container
-runtime; do not use automatic cleanup for workspaces consumed by other host service users.
-Murphy neither elevates privileges nor changes system/proc permissions.
-
-Runtime CLIs are optional when no runtime is detected. An inaccessible runtime or failed
-runtime inspection blocks removal. Murphy never stops or changes containers.
-Cleanup uses only `git worktree remove`, without `--force`, stash, reset, clean or branch deletion.
+Removal keeps the local task branch and its commits, including commits not on a remote
+branch, plus reports, logs, history and session metadata. It never uses `--force`, stash,
+reset, clean or branch deletion. Git removal errors remain visible for operator action.
+Murphy does not stop or modify external processes or containers.
 External processes and container launches do not share Murphy's lock: operators must avoid
 starting new users of a worktree during cleanup.
 
 `murphy status` includes tasks with `cleanup_json` recording the result or blocking reason.
-Blocked cleanup stays visible in the monitor as `CLEANUP`, with the reason below the task;
-repeated identical reasons do not generate GitHub comments or log messages. Reports, logs,
-command outcomes and session bindings remain intact after removal. A persisted removal
+Blocked cleanup stays visible below the task as `Sprzątanie: ...`, preserving the task's
+actual result (for example `ZAKOŃCZONE`). Repeated identical reasons do not generate GitHub
+comments or log messages. Reports, logs, command outcomes and session bindings remain intact after removal. A persisted removal
 marker prevents repeated deletion after restart; an interrupted removal or error after
 invoking Git removal retains `removing` and requires explicit operator reconciliation.
 No automatic retry guesses whether that operation succeeded.
