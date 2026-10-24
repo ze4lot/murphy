@@ -309,8 +309,9 @@ refresh, under its worker lock. The first refresh after startup rechecks automat
 immediately, even when a previous worker left a recent status cache or cleanup error.
 All registered aliases must have fresh, explicit states in
 that refresh; cached closure, missing responses, HTTP 404/410 and API errors cannot authorize
-removal. A closed original issue or merged PR qualifies a task. A merged PR may qualify its
-still-open original issue, but another open alias or branch PR blocks cleanup. Related PRs
+removal. The original issue must be closed: a merged PR alone never finishes an open task,
+including a session waiting for an owner answer or an approved deployment. Any open alias
+or branch PR also blocks cleanup. Related PRs
 are checked with an additional paginated GitHub read for each automatic task in the batch.
 No model calls or separate service are involved.
 
@@ -322,7 +323,7 @@ directory and worktree registration immediately before removal.
 
 Queued/running/blocked commands, queued continuations and unresolved `unknown` outcomes
 prevent cleanup. Staged, unstaged and untracked work also blocks it. After fresh GitHub
-closure/merge and worktree identity checks, Murphy runs ordinary `git worktree remove`.
+issue-closure and worktree identity checks, Murphy runs ordinary `git worktree remove`.
 It does not scan `/proc` or systemd, fetch branches, or require remote ancestry proof.
 Squash merges and deleted remote branches do not veto cleanup.
 
