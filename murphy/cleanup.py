@@ -287,7 +287,6 @@ def retire(state, github, updates, attempted):
             # PRs on this branch also block removal even if not explicitly registered aliases.
             query = urlencode(dict(state='all', head=b.CONFIG.repository.split('/')[0] + ':' + task['branch'], per_page=100))
             pulls = github.api(f'repos/{b.CONFIG.repository}/pulls?{query}', pages=True)
-            merged = any(updates[str(number)]['state'] == 'MERGED' for number in aliases)
             open_pull = None
             for pull in pulls:
                 if (pull['head']['ref'] != task['branch']
@@ -298,15 +297,13 @@ def retire(state, github, updates, attempted):
                     open_pull = pull['number']
                 elif pull['state'] != 'closed':
                     raise ValueError('Related PR state is ambiguous')
-                merged = merged or bool(pull.get('merged_at'))
-            if not (updates.get(str(original), {}).get('state') == 'CLOSED' or merged):
+            if updates.get(str(original), {}).get('state') != 'CLOSED':
                 if task['cleanup_json']:
-                    record(state, task, 'retained', 'Task has no closed issue or merged PR')
+                    record(state, task, 'retained', 'Original issue is still open; merged PR does not finish the task')
                 continue
             if open_pull:
                 raise ValueError(f'Related PR #{open_pull} is still open')
-            if any(updates[str(number)]['state'] == 'OPEN' and (number != original or not merged)
-                   for number in aliases):
+            if any(updates[str(number)]['state'] == 'OPEN' for number in aliases):
                 raise ValueError('Another task issue/PR alias is still open')
             before = validate(state, task, proof)
             resources = container_plan(task['cwd'])

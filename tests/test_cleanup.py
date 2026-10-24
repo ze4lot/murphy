@@ -177,14 +177,36 @@ class CleanupTests(unittest.TestCase):
         self.retire()
         self.assertTrue(self.path.exists())
 
-    def test_open_related_pull_blocks_and_merged_pull_qualifies_open_original(self):
+    def test_open_related_pull_blocks_and_merge_cannot_retire_open_original(self):
         pull = dict(number=8, state='open', merged_at=None,
                     head={'ref': self.task()['branch'], 'repo': {'id': 1}}, base={'repo': {'id': 1}})
         self.api.api.return_value = [pull]
         self.blocked('PR #8 is still open')
         self.updates['7']['state'] = 'OPEN'
         pull.update(state='closed', merged_at='2026-01-01')
+        self.assertEqual(self.retire()['state'], 'retained')
+        self.assertTrue(self.path.exists())
+        self.updates['7']['state'] = 'CLOSED'
         self.assertEqual(self.retire()['state'], 'removed')
+
+    def test_merged_pr_preserves_waiting_open_task_and_allows_original_session_continuation(self):
+        self.updates['7']['state'] = 'OPEN'
+        self.api.api.return_value = [dict(number=8, state='closed', merged_at='2026-01-01',
+            head={'ref': self.task()['branch'], 'repo': {'id': 1}}, base={'repo': {'id': 1}})]
+        with self.state.db:
+            self.state.db.execute('UPDATE commands SET state=?', ('waiting_for_user',))
+            self.state.db.execute('UPDATE tasks SET thread_id=?', ('fixture-session',))
+            self.state.db.execute('INSERT INTO items VALUES (8,?)', ('issue-7',))
+        self.updates['8'] = {'state': 'MERGED'}
+        self.retire()
+        self.assertTrue(self.path.exists())
+        self.assertEqual(self.task()['thread_id'], 'fixture-session')
+        self.assertEqual(self.state.row(self.ident)['state'], 'waiting_for_user')
+        self.container_plan.assert_not_called()
+        self.repair_permissions.assert_not_called()
+        continued = self.state.enqueue('issue-7', 'continue', 'Owner answer', item=7)
+        self.assertEqual(self.state.row(continued)['state'], 'queued')
+        self.assertNotEqual(json.loads(self.task()['cleanup_json'] or '{}').get('state'), 'removed')
 
     def test_manual_tasks_and_source_checkout_are_never_removed(self):
         with self.state.db:

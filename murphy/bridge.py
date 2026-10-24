@@ -937,7 +937,7 @@ class Worker:
                   'honor any explicit read-only instructions from the owner.\n\n'
                   'Use a separate Compose project with this worktree as its project working directory. '
                   'Label standalone task containers and private networks/volumes with the container cleanup label below. '
-                  'Issue closure or PR merge removes these task resources, including running containers. '
+                  'Closing the original issue removes these task resources, including running containers. '
                   'Do not assign the task label to shared services or resources.\n\n'
                   'OpenSSH ControlMaster sockets may use ${MURPHY_SSH_CONTROL_DIR}/%C; this private project directory '
                   'is writable in the sandbox. Use ControlMaster auto and a finite ControlPersist (for example 60), '

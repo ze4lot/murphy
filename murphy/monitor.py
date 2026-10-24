@@ -344,7 +344,8 @@ def render(data, width=100, height=24, footer='Ctrl+C — zamknij podgląd'):
             lines.append(' │ '.join(fit(value, size) for value, size in zip(values, widths)))
         else:
             lines.extend([f'{row["id"]} · {status} · {elapsed}', f'  {row["repository"]} · {row["task"]}'])
-        if row.get('cleanup', {}).get('reason') and len(lines) < height - len(bottom) - 1:
+        if (row.get('cleanup', {}).get('state') in ('blocked', 'removing')
+                and row['cleanup'].get('reason') and len(lines) < height - len(bottom) - 1):
             lines.append('  Sprzątanie: ' + row['cleanup']['reason'])
         elif row['activity'] and len(lines) < height - len(bottom) - 1:
             event = row['activity']

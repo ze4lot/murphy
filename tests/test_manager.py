@@ -660,6 +660,24 @@ class ManagerTests(unittest.TestCase):
                 self.assertEqual(state.row(ident)['state'], 'succeeded')
                 self.assertEqual(state.row(ident)['detail'], 'Preserved report')
 
+    def test_successful_cleanup_reason_does_not_hide_failed_continuation_or_owner_question(self):
+        _, state, _ = self.add_project('one', 1)
+        self.manager.register('example/one', 'manual', self.root / 'one', 'main', [7])
+        ident = state.enqueue('manual', 'start', 'Work', item=7)
+        self.manager.sync_queue()
+        for status, cleanup_status, detail in (
+                ('failed', 'removed', 'Task worktree was removed'),
+                ('waiting_for_user', 'retained', 'Need an owner decision')):
+            with self.subTest(status=status):
+                state.finish(ident, status, detail)
+                with state.db:
+                    state.set('monitor_issues', json.dumps({'7': {'state': 'OPEN', 'checked': 1}}))
+                    state.db.execute('UPDATE tasks SET cleanup_json=?',
+                                     (json.dumps({'state': cleanup_status, 'reason': 'Old cleanup result'}),))
+                rendered = monitor.render(monitor.snapshot(self.manager.directory), width=120, height=30)
+                self.assertIn(detail, rendered)
+                self.assertNotIn('Old cleanup result', rendered)
+
     def test_cleanup_refresh_includes_all_aliases_and_passes_only_fresh_results(self):
         from murphy import cleanup
         _, state, worker = self.add_project('one', 1)
