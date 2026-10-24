@@ -379,7 +379,7 @@ class State:
                 started TEXT, finished TEXT, report_id INTEGER
             );
         ''')
-        for table, columns in {'tasks': ('reasoning', 'issue_json', 'checkout_json'), 'commands': ('plan', 'reasoning')}.items():
+        for table, columns in {'tasks': ('reasoning', 'issue_json', 'checkout_json', 'automatic_json', 'cleanup_json'), 'commands': ('plan', 'reasoning')}.items():
             existing = {row['name'] for row in self.db.execute(f'PRAGMA table_info({table})')}
             for column in columns:
                 if column not in existing:
@@ -823,6 +823,10 @@ class Worker:
         git(config['repo'], 'worktree', 'add', '-b', branch, str(cwd), f'refs/remotes/origin/{base}')
         self.state.register(name, cwd, branch, [row['item']], config['model'], effort, issue)
         with self.state.db:
+            info = checkout(str(cwd))
+            self.state.db.execute('UPDATE tasks SET automatic_json=? WHERE name=?',
+                                  (json.dumps(dict(repo=config['repo'], cwd=str(cwd), branch=branch,
+                                                   common_dir=info['common_dir'], git_dir=info['git_dir'])), name))
             self.state.db.execute('UPDATE commands SET task=? WHERE id=?', (name, row['id']))
 
     def block_dirty_source(self, row):
@@ -871,6 +875,10 @@ class Worker:
                 self.state.finish(row['id'], 'unknown' if changed else 'failed', f'Automatic start stopped: {error}')
                 return
         task = self.state.db.execute('SELECT * FROM tasks WHERE name=?', (row['task'],)).fetchone()
+        if task['cleanup_json'] and json.loads(task['cleanup_json']).get('state') in ('removed', 'removing'):
+            self.state.finish(row['id'], 'failed', 'Task worktree was removed or cleanup needs reconciliation. '
+                              'History/session retained; register a new task explicitly after operator inspection.')
+            return
         if (row['verb'] == 'start') == bool(task['thread_id']):
             self.state.finish(row['id'], 'failed', 'start requires no session; continue requires the registered session UUID')
             return

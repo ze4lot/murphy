@@ -236,12 +236,18 @@ def snapshot(directory=None):
         with database(project_dir / 'state.sqlite') as state:
             saved = state.execute("SELECT value FROM settings WHERE key='monitor_issues'").fetchone()
             cache = issue_cache(saved[0] if saved else None)
+            cleanup = {}
+            if 'cleanup_json' in {column['name'] for column in state.execute('PRAGMA table_info(tasks)')}:
+                cleanup = {task['name']: json.loads(task['cleanup_json']) for task in
+                           state.execute('SELECT name,cleanup_json FROM tasks WHERE cleanup_json IS NOT NULL')}
             for row in task_commands(state):
                 ident = tickets.get((project['id'], row['id']))
                 if ident is None:  # Enrollment belongs to the coordinator, including after a crash.
                     continue
                 issue = cache.get(str(row['item']), {})
-                if issue.get('state') in ('CLOSED', 'MERGED', 'DELETED') and row['state'] not in ALWAYS_VISIBLE:
+                retirement = cleanup.get(row['task'], {})
+                if (issue.get('state') in ('CLOSED', 'MERGED', 'DELETED') and row['state'] not in ALWAYS_VISIBLE
+                        and retirement.get('state') not in ('blocked', 'removing')):
                     hidden_closed += 1
                     continue
                 title = ''
@@ -253,7 +259,7 @@ def snapshot(directory=None):
                 commands.append({'id': ident, 'repository': project['repository'],
                                  'task': task + (' ' + title if title else ''),
                                  'state': row['state'], 'started': row['started'], 'finished': row['finished'],
-                                 'detail': row['detail'],
+                                 'detail': row['detail'], 'cleanup': retirement,
                                  'activity': activity(project_dir / (row['execution_id'] + '.jsonl'))
                                  if row['state'] == 'running' else None})
     pending = sorted((row for row in commands if row['state'] in PENDING),
@@ -333,12 +339,17 @@ def render(data, width=100, height=24, footer='Ctrl+C — zamknij podgląd'):
         elapsed = duration(row['started'], row['finished'], observed)
         if row['state'] == 'running' and not worker:
             status, elapsed = 'BRAK WORKERA', '—'
+        if (row.get('cleanup', {}).get('state') in ('blocked', 'removing')
+                and row['state'] not in ALWAYS_VISIBLE):
+            status = 'CLEANUP'
         if wide:
             values = (row['id'], row['repository'], row['task'], status, elapsed)
             lines.append(' │ '.join(fit(value, size) for value, size in zip(values, widths)))
         else:
             lines.extend([f'{row["id"]} · {status} · {elapsed}', f'  {row["repository"]} · {row["task"]}'])
-        if row['activity'] and len(lines) < height - len(bottom) - 1:
+        if row.get('cleanup', {}).get('reason') and len(lines) < height - len(bottom) - 1:
+            lines.append('  Cleanup: ' + row['cleanup']['reason'])
+        elif row['activity'] and len(lines) < height - len(bottom) - 1:
             event = row['activity']
             age = f'{max(0, int(observed - event["updated"]))} s temu' if event['updated'] else 'brak zapisów'
             lines.append(f'  Log: {age}' + (' · ' + event['text'] if event['text'] else ''))
