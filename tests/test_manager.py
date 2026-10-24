@@ -634,6 +634,25 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(state.row(ident)['detail'], 'Preserved report')
         self.assertEqual(json.loads(self.manager.status()['tasks'][0]['cleanup_json'])['state'], 'blocked')
 
+    def test_removed_cleanup_hides_closed_history_but_interrupted_cleanup_stays_visible(self):
+        _, state, _ = self.add_project('one', 1)
+        self.manager.register('example/one', 'manual', self.root / 'one', 'main', [7])
+        ident = state.enqueue('manual', 'start', 'Work', item=7)
+        state.finish(ident, 'succeeded', 'Preserved report')
+        self.manager.sync_queue()
+        for status in ('removing', 'removed'):
+            with self.subTest(status=status):
+                with state.db:
+                    state.set('monitor_issues', json.dumps({'7': {'state': 'CLOSED', 'checked': 1}}))
+                    state.db.execute('UPDATE tasks SET cleanup_json=?',
+                                     (json.dumps({'state': status, 'reason': 'Reconciliation result'}),))
+                snapshot = monitor.snapshot(self.manager.directory)
+                self.assertEqual(len(snapshot['commands']), 1 if status == 'removing' else 0)
+                if status == 'removing':
+                    self.assertIn('CLEANUP', monitor.render(snapshot, width=120, height=30))
+                self.assertEqual(state.row(ident)['state'], 'succeeded')
+                self.assertEqual(state.row(ident)['detail'], 'Preserved report')
+
     def test_cleanup_refresh_includes_all_aliases_and_passes_only_fresh_results(self):
         from murphy import cleanup
         _, state, worker = self.add_project('one', 1)

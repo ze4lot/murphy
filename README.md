@@ -326,8 +326,27 @@ therefore require operator inspection even when the code was merged.
 
 Murphy checks Linux process working directories, roots, open files, memory maps and command
 lines, plus Docker/Podman container mounts (including stopped containers that could restart).
-Those CLIs are optional when no runtime is detected. Permission errors, an inaccessible
-runtime or failed inspection block removal. Murphy never stops or changes containers.
+Process inspection runs with ordinary worker permissions. Every visible process with the
+worker's UID in any of its real/effective/saved/filesystem UID fields must be inspectable;
+permission errors block removal, including setuid or non-dumpable processes of this user.
+Missing or unreadable UID information or command lines also blocks removal. Visible path
+references from any UID block removal. PID birth time and UIDs are rechecked to detect
+identity changes during inspection.
+
+Protected cwd/root/file-descriptor/map information for a confirmed different UID (commonly
+root's PID 1) is outside the unprivileged inspection guarantee. Murphy continues checking
+other available information and processes, and records those protected PIDs in the durable
+cleanup reason after removal. This is not evidence that those processes are unused: Linux
+[ptrace permissions](https://man7.org/linux/man-pages/man5/proc_pid_cwd.5.html) prevent an
+ordinary worker from proving that. The guarantee covers visible worker-UID processes and
+containers accessible through the detected local runtimes, not arbitrary privileged or
+other-user services, hidden PID namespaces or services that conceal path references.
+Operators must keep worktree consumers under the worker UID or an inspected local container
+runtime; do not use automatic cleanup for workspaces consumed by other host service users.
+Murphy neither elevates privileges nor changes system/proc permissions.
+
+Runtime CLIs are optional when no runtime is detected. An inaccessible runtime or failed
+runtime inspection blocks removal. Murphy never stops or changes containers.
 Cleanup uses only `git worktree remove`, without `--force`, stash, reset, clean or branch deletion.
 External processes and container launches do not share Murphy's lock: operators must avoid
 starting new users of a worktree during cleanup.
@@ -336,9 +355,20 @@ starting new users of a worktree during cleanup.
 Blocked cleanup stays visible in the monitor as `CLEANUP`, with the reason below the task;
 repeated identical reasons do not generate GitHub comments or log messages. Reports, logs,
 command outcomes and session bindings remain intact after removal. A persisted removal
-marker prevents repeated deletion after restart; an interrupted removal requires explicit
-operator reconciliation. Reopening an issue or submitting `continue` never recreates a
-removed worktree: the command fails with instructions to inspect and register a new task.
+marker prevents repeated deletion after restart; an interrupted removal or error after
+invoking Git removal retains `removing` and requires explicit operator reconciliation.
+No automatic retry guesses whether that operation succeeded.
+
+A directory removed earlier by an operator is reconciled to durable `removed` only after
+fresh closure/merge checks, provenance/source identity and command guards, and confirmation
+that both its Git worktree registration and saved linked Git metadata are also absent.
+The absence is checked again under the write transaction. This records existing absence;
+it does not delete files, prune registrations, fetch through the missing cwd, or certify
+that already deleted work was clean/pushed. A missing directory with remaining registration
+or metadata stays blocked with a specific reconciliation reason. A replaced path or changed
+identity stays blocked; an earlier `removing` marker always requires operator reconciliation.
+History, command outcomes and session bindings remain intact in every case. Reopening an
+issue or submitting `continue` never recreates a removed worktree: the command fails with instructions to inspect and register a new task.
 
 ## State, configuration and execution scope
 
