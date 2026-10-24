@@ -52,28 +52,81 @@ def beneath(value, root):
 
 
 def process_use(cwd, proc=Path('/proc')):
-    """Permission errors are uncertainty, never evidence that a directory is unused."""
+    """Inspect this user's processes strictly; report protected foreign processes.
+
+    Foreign UID internals are outside the unprivileged guarantee, not proven unused.
+    Visible references from those processes still block cleanup.
+    """
     root = Path(cwd)
-    for process in proc.glob('[0-9]*'):
+    limited = []
+    # Directory ownership is not a reliable process UID (e.g. non-dumpable tasks).
+    # Check all four UIDs so a setuid child of this user remains in the strict scope.
+    for process in proc.iterdir():
+        if not process.name.isdecimal():
+            continue
         try:
-            status = (process / 'stat').read_text().rsplit(')', 1)[1].split()[0]
+            identity = (process / 'status').read_text()
+            uids = [int(value) for line in identity.splitlines() if line.startswith('Uid:')
+                    for value in line.split()[1:]]
+            if len(uids) != 4:
+                raise ValueError(f'Cannot establish UID of process {process.name}')
+            foreign = not {os.getuid(), os.geteuid()} & set(uids)
+            birth = (process / 'stat').read_text().rsplit(')', 1)[1].split()
+            if len(birth) < 20:
+                raise ValueError(f'Cannot establish birth time of process {process.name}')
+            status = birth[0]
             if status in ('Z', 'X'):
                 continue
-            for link in [process / 'cwd', process / 'root', *list((process / 'fd').iterdir())]:
+            protected = False
+            # Check cmdline even when cwd/fd/maps are protected by ptrace permissions.
+            # An inaccessible status/cmdline never establishes an unrelated foreign PID.
+            data = (process / 'cmdline').read_bytes()
+            if os.fsencode(cwd) in data:
+                raise ValueError(f'Process {process.name} references worktree (cmdline)')
+            links = [process / 'cwd', process / 'root']
+            try:
+                links.extend((process / 'fd').iterdir())
+            except PermissionError:
+                if not foreign:
+                    raise
+                protected = True
+            for link in links:
                 try:
                     target = os.readlink(link)
                 except FileNotFoundError:
+                    if link.parent == process and not foreign:
+                        raise ValueError(f'Cannot inspect process {process.name}: missing {link.name}')
+                    continue  # FDs can close while inspecting a live process.
+                except PermissionError:
+                    if not foreign:
+                        raise
+                    protected = True
                     continue
                 if target.startswith('/') and beneath(target, root):
                     raise ValueError(f'Process {process.name} uses worktree ({link.name})')
-            for file in ('maps', 'cmdline'):
-                data = (process / file).read_bytes()
+            try:
+                data = (process / 'maps').read_bytes()
+            except PermissionError:
+                if not foreign:
+                    raise
+                protected = True
+            else:
                 if os.fsencode(cwd) in data:
-                    raise ValueError(f'Process {process.name} references worktree ({file})')
-        except (FileNotFoundError, ProcessLookupError):
+                    raise ValueError(f'Process {process.name} references worktree (maps)')
+            current = [int(value) for line in (process / 'status').read_text().splitlines()
+                       if line.startswith('Uid:') for value in line.split()[1:]]
+            after = (process / 'stat').read_text().rsplit(')', 1)[1].split()
+            if len(after) < 20 or current != uids or after[19] != birth[19]:
+                raise ValueError(f'Process {process.name} identity changed during inspection')
+            if protected:
+                limited.append(process.name)
+        except (FileNotFoundError, ProcessLookupError) as error:
+            if process.exists():
+                raise ValueError(f'Cannot inspect live process {process.name}: missing process information') from error
             continue  # Process exited while inspecting it.
         except PermissionError as error:
             raise ValueError(f'Cannot inspect process {process.name}: permission denied') from error
+    return limited
 
 
 def runtime_use(cwd):
@@ -125,18 +178,6 @@ def validate(state, task, proof):
     source = b.checkout(config['repo'])
     if source['common_dir'] != task['common_dir'] or path == Path(config['repo']):
         raise ValueError('Source checkout identity changed or task is the main checkout')
-    info = b.checkout(str(path))
-    if (info['branch'] != task['branch'] or info['common_dir'] != task['common_dir']
-            or info['git_dir'] != proof['git_dir'] or info['git_dir'] == info['common_dir']):
-        raise ValueError('Worktree Git identity changed')
-    entries = b.git(config['repo'], 'worktree', 'list', '--porcelain', '-z').split('\0\0')
-    expected_entry = {f'worktree {path}', f'branch refs/heads/{task["branch"]}', f'HEAD {info["head"]}'}
-    matches = [set(entry.split('\0')) for entry in entries if f'worktree {path}' in entry.split('\0')]
-    if len(matches) != 1 or not expected_entry <= matches[0] or any(
-            value.startswith(('locked', 'prunable')) for value in matches[0]):
-        raise ValueError('Worktree registration is missing, locked or changed')
-    if info['dirty']:
-        raise ValueError('Worktree has staged, unstaged or untracked work')
     other = state.db.execute('SELECT name FROM tasks WHERE cwd=? AND name!=?', (str(path), task['name'])).fetchone()
     if other:
         raise ValueError('Worktree is also registered to another task')
@@ -145,6 +186,34 @@ def validate(state, task, proof):
         AND state IN ('queued','running','blocked','unknown') LIMIT 1""", (task['name'], task['name'])).fetchone()
     if busy:
         raise ValueError(f'Command {busy["id"]} is {busy["state"]}')
+    entries = b.git(config['repo'], 'worktree', 'list', '--porcelain', '-z').split('\0\0')
+    matches = [set(entry.split('\0')) for entry in entries if f'worktree {path}' in entry.split('\0')]
+    try:
+        path.lstat()  # Unlike exists(), permission errors are not absence.
+    except FileNotFoundError:
+        if matches:
+            raise ValueError('Worktree directory is absent but Git registration remains; operator reconciliation required')
+        git_dir = Path(proof['git_dir'])
+        if git_dir.parent != Path(task['common_dir']) / 'worktrees':
+            raise ValueError('Missing worktree Git identity changed')
+        try:
+            git_dir.lstat()
+        except FileNotFoundError:
+            return None  # Confirmed operator removal; no checkout/header checks in a missing cwd.
+        raise ValueError('Worktree directory is absent but Git metadata remains; operator reconciliation required')
+    try:
+        info = b.checkout(str(path))
+    except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as error:
+        raise ValueError('Worktree Git identity changed or cannot be inspected') from error
+    if (info['branch'] != task['branch'] or info['common_dir'] != task['common_dir']
+            or info['git_dir'] != proof['git_dir'] or info['git_dir'] == info['common_dir']):
+        raise ValueError('Worktree Git identity changed')
+    expected_entry = {f'worktree {path}', f'branch refs/heads/{task["branch"]}', f'HEAD {info["head"]}'}
+    if len(matches) != 1 or not expected_entry <= matches[0] or any(
+            value.startswith(('locked', 'prunable')) for value in matches[0]):
+        raise ValueError('Worktree registration is missing, locked or changed')
+    if info['dirty']:
+        raise ValueError('Worktree has staged, unstaged or untracked work')
     return info
 
 
@@ -171,6 +240,7 @@ def retire(state, github, updates, attempted):
         if json.loads(task['cleanup_json'] or '{}').get('state') == 'removing':
             record(state, task, 'removing', 'Interrupted cleanup requires operator reconciliation; no automatic replay')
             continue
+        removal_started = False
         try:
             if not aliases or any(str(number) not in updates for number in aliases):
                 raise ValueError('GitHub state is unavailable or ambiguous for a task alias')
@@ -203,8 +273,15 @@ def retire(state, github, updates, attempted):
                    for number in aliases):
                 raise ValueError('Another task issue/PR alias is still open')
             before = validate(state, task, proof)
+            if before is None:
+                with state.db:
+                    state.db.execute('BEGIN IMMEDIATE')
+                    if validate(state, task, proof) is not None:
+                        raise ValueError('Worktree reappeared during absence checks')
+                    record(state, task, 'removed', 'Worktree already absent and unregistered; history/session retained')
+                continue
             remote_saved(task['cwd'], before['head'])
-            process_use(task['cwd'])
+            limited = process_use(task['cwd'])
             runtime_use(task['cwd'])
             record(state, task, 'removing', 'Removal started; interrupted operations require reconciliation')
             # The coordinator lock excludes executors/registrations. This write transaction
@@ -213,7 +290,13 @@ def retire(state, github, updates, attempted):
                 state.db.execute('BEGIN IMMEDIATE')
                 if validate(state, task, proof) != before:
                     raise ValueError('Worktree changed during cleanup checks')
+                removal_started = True
                 b.git(proof['repo'], 'worktree', 'remove', task['cwd'])
-                record(state, task, 'removed', 'Worktree removed; history and session retained')
+                reason = 'Worktree removed; history and session retained'
+                if limited:
+                    reason += '; protected foreign-UID processes outside inspection guarantee: ' + ', '.join(limited)
+                record(state, task, 'removed', reason)
         except (ValueError, KeyError, TypeError, RuntimeError, OSError, subprocess.SubprocessError) as error:
-            record(state, task, 'blocked', str(error))
+            record(state, task, 'removing' if removal_started else 'blocked',
+                   ('Removal outcome requires operator reconciliation; no automatic replay: ' if removal_started else '')
+                   + str(error))

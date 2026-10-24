@@ -2,6 +2,7 @@
 """Worktree lifecycle tests: real temporary Git repositories, no external services."""
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -64,7 +65,7 @@ class CleanupTests(unittest.TestCase):
         self.api.api.return_value = []
         self.updates = {'7': {'state': 'CLOSED', 'title': 'Done'}}
         for name in ('process_use', 'runtime_use'):
-            mocked = patch.object(c, name)
+            mocked = patch.object(c, name, return_value=[])
             mocked.start()
             self.addCleanup(mocked.stop)
 
@@ -228,6 +229,103 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual(self.state.row(ident)['state'], 'failed')
         self.assertIn('removed', self.state.row(ident)['detail'])
 
+    def test_operator_removed_worktree_is_reconciled_without_checkout_or_replay(self):
+        with self.state.db:
+            self.state.db.execute('UPDATE tasks SET thread_id=?', ('fixture-session',))
+        self.git('worktree', 'remove', str(self.path))
+        real_checkout = b.checkout
+        def existing_only(cwd):
+            self.assertNotEqual(cwd, str(self.path))
+            return real_checkout(cwd)
+        with patch.object(b, 'checkout', side_effect=existing_only), patch.object(c, 'remote_saved') as remote:
+            result = self.retire()
+            self.assertEqual(result['state'], 'removed')
+            self.assertIn('already absent and unregistered', result['reason'])
+            remote.assert_not_called()
+            c.process_use.assert_not_called()
+            c.runtime_use.assert_not_called()
+            self.assertEqual(self.retire(), result)
+        self.assertEqual(self.state.row(self.ident)['detail'], 'Historical report')
+        self.assertEqual(self.task()['thread_id'], 'fixture-session')
+        ident = self.state.enqueue('issue-7', 'continue', 'resume', item=7)
+        worker = b.Worker(self.state)
+        with patch.object(worker, 'run_codex') as model, patch.object(worker, 'block_dirty_source', return_value=False):
+            worker.execute(self.state.row(ident), -1)
+            model.assert_not_called()
+        self.assertIn('removed', self.state.row(ident)['detail'])
+
+    def test_missing_directory_with_stale_registration_requires_reconciliation(self):
+        shutil.rmtree(self.path)
+        result = self.retire()
+        self.assertEqual(result['state'], 'blocked')
+        self.assertIn('directory is absent but Git registration remains', result['reason'])
+        self.assertIn(str(self.path), self.git('worktree', 'list'))
+
+    def test_missing_worktree_does_not_hide_busy_or_unknown_commands(self):
+        self.git('worktree', 'remove', str(self.path))
+        for status in ('queued', 'running', 'blocked', 'unknown'):
+            with self.subTest(status=status), self.state.db:
+                self.state.db.execute('UPDATE commands SET state=?', (status,))
+                result = self.retire()
+                self.assertEqual(result['state'], 'blocked')
+                self.assertIn(status, result['reason'])
+                self.assertEqual(self.state.row(self.ident)['state'], status)
+
+    def test_missing_worktree_retains_identity_and_interrupted_operation_guards(self):
+        self.git('worktree', 'remove', str(self.path))
+        with self.state.db:
+            self.state.db.execute('UPDATE tasks SET branch=?', ('wrong',))
+        self.assertIn('identity changed', self.retire()['reason'])
+        c.record(self.state, self.task(), 'removing', 'Interrupted')
+        self.assertEqual(self.retire()['state'], 'removing')
+
+    def test_failed_removal_never_replays_uncertain_operation(self):
+        original_git = b.git
+        calls = []
+        def uncertain(cwd, *args):
+            if args[:2] == ('worktree', 'remove'):
+                calls.append(args)
+                original_git(cwd, *args)
+                raise OSError('lost response after removal')
+            return original_git(cwd, *args)
+        with patch.object(b, 'git', side_effect=uncertain):
+            result = self.retire()
+            self.assertEqual(result['state'], 'removing')
+            self.assertIn('no automatic replay', result['reason'])
+            self.assertFalse(self.path.exists())
+            self.assertEqual(self.retire()['state'], 'removing')
+            self.assertEqual(len(calls), 1)
+
+    def test_replaced_directory_is_identity_failure_not_missing_checkout_headers(self):
+        self.git('worktree', 'remove', str(self.path))
+        self.path.mkdir()
+        self.blocked('Git identity changed')
+
+    def test_reappeared_worktree_during_absence_checks_is_preserved(self):
+        self.git('worktree', 'remove', str(self.path))
+        original = c.validate
+        def recreate(*args):
+            result = original(*args)
+            if result is None:
+                self.git('worktree', 'add', str(self.path), self.task()['branch'])
+            return result
+        with patch.object(c, 'validate', side_effect=recreate):
+            self.blocked('reappeared during absence checks')
+
+    def test_missing_directory_permission_error_cannot_authorize_absence(self):
+        self.git('worktree', 'remove', str(self.path))
+        original = Path.lstat
+        def denied(path, *args, **kwargs):
+            if path == self.path:
+                raise PermissionError('cannot stat worktree')
+            return original(path, *args, **kwargs)
+        with patch.object(Path, 'lstat', denied):
+            self.assertEqual(self.retire()['state'], 'blocked')
+
+    def test_removed_status_records_foreign_process_inspection_boundary(self):
+        with patch.object(c, 'process_use', return_value=['1']):
+            self.assertIn('foreign-UID processes outside inspection guarantee: 1', self.retire()['reason'])
+
 
 class RuntimeTests(unittest.TestCase):
     def test_no_runtime_is_not_a_dependency(self):
@@ -262,11 +360,106 @@ class RuntimeTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'permission denied'):
                     c.process_use('/tmp/task', proc=Path(root))
 
+    def process_fixture(self, root, uid, pid='1'):
+        process = Path(root) / pid
+        (process / 'fd').mkdir(parents=True)
+        (process / 'stat').write_text(pid + ' (fixture) S ' + '0 ' * 19)
+        (process / 'status').write_text('Uid: ' + ' '.join([str(uid)] * 4))
+        (process / 'cmdline').write_bytes(b'/sbin/init')
+        (process / 'maps').write_bytes(b'')
+        (process / 'cwd').symlink_to('/unrelated')
+        (process / 'root').symlink_to('/')
+        return process
+
+    def test_inaccessible_foreign_pid_one_does_not_block_user_worktrees(self):
+        with tempfile.TemporaryDirectory() as root:
+            process = self.process_fixture(root, os.getuid() + 1)
+            original_readlink = os.readlink
+            def protected(path, *args, **kwargs):
+                if Path(path) == process / 'cwd':
+                    raise PermissionError('ptrace denied')
+                return original_readlink(path, *args, **kwargs)
+            with patch.object(os, 'readlink', side_effect=protected):
+                self.assertEqual(c.process_use('/tmp/task', Path(root)), ['1'])
+
+    def test_foreign_pid_does_not_hide_same_uid_use_or_permission_error(self):
+        with tempfile.TemporaryDirectory() as root:
+            foreign = self.process_fixture(root, os.getuid() + 1)
+            own = self.process_fixture(root, os.getuid(), '123')
+            (own / 'cwd').unlink()
+            (own / 'cwd').symlink_to('/tmp/task')
+            original = os.readlink
+            def protected(path, *args, **kwargs):
+                if Path(path) == foreign / 'cwd':
+                    raise PermissionError('ptrace denied')
+                return original(path, *args, **kwargs)
+            with patch.object(os, 'readlink', side_effect=protected):
+                with self.assertRaisesRegex(ValueError, 'Process 123 uses'):
+                    c.process_use('/tmp/task', Path(root))
+            with patch.object(os, 'readlink', side_effect=PermissionError('denied')):
+                with self.assertRaisesRegex(ValueError, 'process 123: permission denied'):
+                    c.process_use('/tmp/task', Path(root))
+
+    def test_visible_foreign_process_reference_blocks_even_with_protected_cwd(self):
+        with tempfile.TemporaryDirectory() as root:
+            process = self.process_fixture(root, os.getuid() + 1)
+            (process / 'maps').write_bytes(b'/tmp/task/library.so')
+            with patch.object(os, 'readlink', side_effect=PermissionError('denied')):
+                with self.assertRaisesRegex(ValueError, 'references worktree.*maps'):
+                    c.process_use('/tmp/task', Path(root))
+            (process / 'cmdline').write_bytes(b'php\0/tmp/task/server.php')
+            with self.assertRaisesRegex(ValueError, 'references worktree.*cmdline'):
+                c.process_use('/tmp/task', Path(root))
+
+    def test_same_uid_open_file_map_and_root_block(self):
+        for kind in ('fd', 'maps', 'root'):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as root:
+                process = self.process_fixture(root, os.getuid())
+                if kind == 'maps':
+                    (process / 'maps').write_bytes(b'/tmp/task/lib.so')
+                else:
+                    link = process / ('fd/4' if kind == 'fd' else 'root')
+                    if kind == 'root':
+                        link.unlink()
+                    link.symlink_to('/tmp/task/child')
+                with self.assertRaisesRegex(ValueError, 'Process 1 (uses|references)'):
+                    c.process_use('/tmp/task', Path(root))
+
+    def test_missing_uid_information_blocks_instead_of_excluding_process(self):
+        with tempfile.TemporaryDirectory() as root:
+            process = self.process_fixture(root, os.getuid() + 1)
+            (process / 'status').write_text('Name: init')
+            with self.assertRaisesRegex(ValueError, 'Cannot establish UID'):
+                c.process_use('/tmp/task', Path(root))
+
+    def test_same_uid_protected_pid_one_is_still_a_blocker(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.process_fixture(root, os.getuid())
+            with patch.object(os, 'readlink', side_effect=PermissionError('restricted')):
+                with self.assertRaisesRegex(ValueError, 'process 1: permission denied'):
+                    c.process_use('/tmp/task', Path(root))
+
+    def test_changed_process_identity_cannot_be_excluded_as_foreign(self):
+        with tempfile.TemporaryDirectory() as root:
+            process = self.process_fixture(root, os.getuid() + 1)
+            original = Path.read_text
+            def changed(path, *args, **kwargs):
+                result = original(path, *args, **kwargs)
+                if path == process / 'stat':
+                    (process / 'status').write_text('Uid: ' + ' '.join([str(os.getuid())] * 4))
+                return result
+            with patch.object(Path, 'read_text', changed), \
+                    patch.object(os, 'readlink', side_effect=PermissionError('restricted')):
+                with self.assertRaisesRegex(ValueError, 'identity changed'):
+                    c.process_use('/tmp/task', Path(root))
+
     def test_process_with_cwd_in_worktree_blocks(self):
         with tempfile.TemporaryDirectory() as root:
             process = Path(root) / '123'
             (process / 'fd').mkdir(parents=True)
-            (process / 'stat').write_text('123 (fixture) S 1')
+            (process / 'stat').write_text('123 (fixture) S ' + '0 ' * 19)
+            (process / 'status').write_text('Uid: ' + ' '.join([str(os.getuid())] * 4))
+            (process / 'cmdline').write_bytes(b'fixture')
             (process / 'cwd').symlink_to('/tmp/task/child')
             with self.assertRaisesRegex(ValueError, 'Process 123 uses'):
                 c.process_use('/tmp/task', proc=Path(root))
