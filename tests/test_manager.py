@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from murphy import bridge as b
 from murphy import cli
+from murphy import cleanup
 from murphy import monitor
 from murphy.manager import Account, Manager
 
@@ -40,6 +41,9 @@ class ManagerTests(unittest.TestCase):
         self.manager = Manager(self.root / 'state')
         self.manager.timeout = 3
         self.addCleanup(self.manager.close)
+        containers = patch.object(cleanup, 'container_plan', return_value=[])
+        containers.start()
+        self.addCleanup(containers.stop)
         account_api = patch.object(Account, 'api', autospec=True, side_effect=self.account_api)
         account_api.start()
         self.addCleanup(account_api.stop)
@@ -625,12 +629,15 @@ class ManagerTests(unittest.TestCase):
         with state.db:
             state.set('monitor_issues', json.dumps({'7': {'state': 'CLOSED', 'checked': 1}}))
             state.db.execute('UPDATE tasks SET cleanup_json=?',
-                             (json.dumps({'state': 'blocked', 'reason': 'docker container mounts worktree'}),))
+                             (json.dumps({'state': 'blocked', 'reason': 'git worktree remove failed'}),))
         self.manager.sync_queue()
         snapshot = monitor.snapshot(self.manager.directory)
         self.assertEqual(len(snapshot['commands']), 1)
         self.assertEqual(snapshot['hidden_closed'], 0)
-        self.assertIn('docker container mounts worktree', monitor.render(snapshot, width=120, height=30))
+        rendered = monitor.render(snapshot, width=120, height=30)
+        self.assertIn('ZAKOŃCZONE', rendered)
+        self.assertIn('Sprzątanie: git worktree remove failed', rendered)
+        self.assertNotIn('CLEANUP', rendered)
         self.assertEqual(state.row(ident)['detail'], 'Preserved report')
         self.assertEqual(json.loads(self.manager.status()['tasks'][0]['cleanup_json'])['state'], 'blocked')
 
@@ -649,7 +656,7 @@ class ManagerTests(unittest.TestCase):
                 snapshot = monitor.snapshot(self.manager.directory)
                 self.assertEqual(len(snapshot['commands']), 1 if status == 'removing' else 0)
                 if status == 'removing':
-                    self.assertIn('CLEANUP', monitor.render(snapshot, width=120, height=30))
+                    self.assertIn('Sprzątanie:', monitor.render(snapshot, width=120, height=30))
                 self.assertEqual(state.row(ident)['state'], 'succeeded')
                 self.assertEqual(state.row(ident)['detail'], 'Preserved report')
 

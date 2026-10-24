@@ -692,6 +692,7 @@ class BridgeTests(unittest.TestCase):
             self.assertNotIn(str(Path.home() / '.ssh'), config['permissions']['murphy']['filesystem'])
             self.assertIn('commit, push the task branch', event['prompt'])
             self.assertIn('Configured GitHub CLI executable:', event['prompt'])
+            self.assertIn('Container cleanup label: io.murphy.worktree=' + str(self.cwd), event['prompt'])
             self.assertIn('--output-schema', args)
             schema = json.loads(Path(args[args.index('--output-schema') + 1]).read_text())
             self.assertEqual(schema, b.TURN_SCHEMA)
