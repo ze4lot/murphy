@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from murphy import bridge as b
 from murphy import cli
+from murphy import cleanup
 from murphy import monitor
 from murphy.manager import Account, Manager
 
@@ -40,6 +41,9 @@ class ManagerTests(unittest.TestCase):
         self.manager = Manager(self.root / 'state')
         self.manager.timeout = 3
         self.addCleanup(self.manager.close)
+        containers = patch.object(cleanup, 'container_plan', return_value=[])
+        containers.start()
+        self.addCleanup(containers.stop)
         account_api = patch.object(Account, 'api', autospec=True, side_effect=self.account_api)
         account_api.start()
         self.addCleanup(account_api.stop)

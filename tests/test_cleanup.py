@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Worktree lifecycle tests: real temporary Git repositories, no external services."""
 import json
+import os
 import shutil
 from pathlib import Path
 import subprocess
@@ -63,6 +64,9 @@ class CleanupTests(unittest.TestCase):
         self.api = Mock()
         self.api.api.return_value = []
         self.updates = {'7': {'state': 'CLOSED', 'title': 'Done'}}
+        inventory = patch.object(c, 'container_plan', return_value=[])
+        self.container_plan = inventory.start()
+        self.addCleanup(inventory.stop)
 
     def run_git(self, *args):
         subprocess.run(['git', *args], check=True, capture_output=True)
@@ -149,7 +153,7 @@ class CleanupTests(unittest.TestCase):
             self.assertNotIn(args[0], ('fetch', 'ls-remote', 'for-each-ref'))
             return real_git(cwd, *args)
         # External operations go through Git and the explicit GitHub double only.
-        # Any process/container CLI or /proc traversal would fail this regression.
+        # Container inventory is doubled; no /proc traversal or remote Git fetch is needed.
         run = c.subprocess.run
         def git_only(args, *a, **kw):
             self.assertEqual(args[0], 'git')
@@ -333,7 +337,7 @@ class CleanupTests(unittest.TestCase):
                 self.git('worktree', 'add', str(self.path), self.task()['branch'])
             return result
         with patch.object(c, 'validate', side_effect=recreate):
-            self.blocked('reappeared during absence checks')
+            self.blocked('reappeared during cleanup checks')
 
     def test_missing_directory_permission_error_cannot_authorize_absence(self):
         self.git('worktree', 'remove', str(self.path))
@@ -344,6 +348,225 @@ class CleanupTests(unittest.TestCase):
             return original(path, *args, **kwargs)
         with patch.object(Path, 'lstat', denied):
             self.assertEqual(self.retire()['state'], 'blocked')
+
+    def test_task_containers_are_removed_before_worktree_with_durable_resource_plan(self):
+        plans = [dict(runtime=['fixture-docker'], containers=['task-app'], networks=[], volumes=[])]
+        self.container_plan.side_effect = [plans, []]
+        def remove(recorded):
+            self.assertTrue(self.path.exists())
+            saved = json.loads(self.task()['cleanup_json'])
+            self.assertEqual(saved['state'], 'removing')
+            self.assertEqual(saved['resources'], recorded)
+        with patch.object(c, 'remove_containers', side_effect=remove) as cleanup:
+            self.assertEqual(self.retire()['state'], 'removed')
+            cleanup.assert_called_once_with(plans)
+        self.assertFalse(self.path.exists())
+
+    def test_container_failure_retains_worktree_plan_and_never_claims_success_or_replays(self):
+        plans = [dict(runtime=['fixture-docker'], containers=['task-app'], networks=[], volumes=[])]
+        self.container_plan.return_value = plans
+        with patch.object(c, 'remove_containers', side_effect=ValueError('container removal failed')) as cleanup:
+            result = self.retire()
+            self.assertEqual(result['state'], 'removing')
+            self.assertEqual(result['resources'], plans)
+            self.assertIn('container removal failed', result['reason'])
+            self.assertEqual(self.retire()['state'], 'removing')
+            cleanup.assert_called_once()
+        self.assertTrue(self.path.exists())
+        self.assertEqual(self.state.row(self.ident)['state'], 'succeeded')
+
+    def test_container_inventory_failure_does_not_remove_worktree(self):
+        self.container_plan.side_effect = ValueError('runtime unavailable')
+        self.blocked('runtime unavailable')
+
+    def test_absent_worktree_still_cleans_orphaned_task_containers(self):
+        self.git('worktree', 'remove', str(self.path))
+        plans = [dict(runtime=['fixture-docker'], containers=['orphan'], networks=[], volumes=[])]
+        self.container_plan.side_effect = [plans, []]
+        with patch.object(c, 'remove_containers') as cleanup:
+            self.assertEqual(self.retire()['state'], 'removed')
+            cleanup.assert_called_once_with(plans)
+
+    def test_remaining_containers_prevent_success_and_worktree_removal(self):
+        self.container_plan.return_value = [dict(runtime=['fixture-docker'], containers=['task-app'], networks=[], volumes=[])]
+        with patch.object(c, 'remove_containers'):
+            self.assertEqual(self.retire()['state'], 'removing')
+        self.assertTrue(self.path.exists())
+
+
+class ContainerTests(unittest.TestCase):
+    def setUp(self):
+        self.cwd = '/tmp/fixture-task'
+        self.containers, self.networks, self.volumes, self.removed = {}, {}, {}, []
+        self.environment = patch.dict(os.environ, {}, clear=True)
+        self.environment.start()
+        self.addCleanup(self.environment.stop)
+        cli = patch.object(c.shutil, 'which', side_effect=lambda name: name if name == 'docker' else None)
+        cli.start()
+        self.addCleanup(cli.stop)
+        sockets = patch.object(Path, 'exists', return_value=False)
+        sockets.start()
+        self.addCleanup(sockets.stop)
+        self.real_runtime_call = c.runtime_call
+        calls = patch.object(c, 'runtime_call', side_effect=self.call)
+        self.calls = calls.start()
+        self.addCleanup(calls.stop)
+
+    def container(self, ident, directory=None, project=None, mounts=None, labels=None):
+        labels = dict(labels or {})
+        if directory:
+            labels[c.DIRECTORY_LABEL] = directory
+        if project:
+            labels[c.PROJECT_LABEL] = project
+        self.containers[ident] = dict(Id=ident, Config={'Labels': labels}, Mounts=mounts or [],
+                                      State={'Running': True}, NetworkSettings={'Networks': {}})
+        return self.containers[ident]
+
+    def resource(self, kind, ident, project=None, task=False):
+        labels = {c.PROJECT_LABEL: project} if project else {}
+        if task:
+            labels[c.TASK_LABEL] = self.cwd
+        resource = dict(Name=ident, Id=ident, Labels=labels, CreatedAt='2026-01-01T00:00:00Z', Containers={})
+        (self.networks if kind == 'network' else self.volumes)[ident] = resource
+        return resource
+
+    def call(self, runtime, *args):
+        if args[:2] == ('context', 'inspect'):
+            return json.dumps('unix:///fixture.sock')
+        self.assertTrue('--host' in runtime or '--remote=false' in runtime)
+        if args[0] == 'ps':
+            return '\n'.join(self.containers)
+        kind, verb = args[:2]
+        objects = {'container': self.containers, 'network': self.networks, 'volume': self.volumes}[kind]
+        if verb == 'inspect':
+            records = [objects[ident] for ident in args[2:]]
+            if runtime[0] == 'podman' and kind == 'network':
+                records = [{key.lower(): value for key, value in item.items()} for item in records]
+            return json.dumps(records)
+        if verb == 'ls':
+            key, value = args[-1].removeprefix('label=').split('=', 1)
+            return '\n'.join(ident for ident, item in objects.items() if item['Labels'].get(key) == value)
+        self.assertEqual(verb, 'rm')
+        ident = args[-1]
+        if kind == 'container':
+            self.assertIn('--force', args)
+            self.assertIn('--volumes', args)
+        else:
+            self.assertNotIn('--force', args)
+        self.removed.append((kind, ident))
+        del objects[ident]
+        return ident
+
+    def test_running_compose_services_and_private_resources_removed_without_other_project(self):
+        self.container('task-app', self.cwd, 'task')
+        self.container('task-db', self.cwd, 'task')['State']['Running'] = False
+        self.container('other-app', '/tmp/other-task', 'other')
+        self.resource('network', 'task-net', 'task')
+        self.resource('volume', 'task-data', 'task')
+        self.resource('network', 'other-net', 'other')
+        self.resource('volume', 'other-data', 'other')
+        plans = c.container_plan(self.cwd)
+        self.assertEqual(plans[0]['containers'], ['task-app', 'task-db'])
+        c.remove_containers(plans)
+        self.assertEqual(self.removed, [('container', 'task-app'), ('container', 'task-db'),
+                                       ('network', 'task-net'), ('volume', 'task-data')])
+        self.assertEqual(set(self.containers), {'other-app'})
+        self.assertEqual(set(self.networks), {'other-net'})
+        self.assertEqual(set(self.volumes), {'other-data'})
+        self.assertEqual(c.container_plan(self.cwd), [])
+
+    def test_standalone_bind_mount_and_explicit_task_labels_are_owned(self):
+        self.container('mounted', mounts=[dict(Type='bind', Source=self.cwd + '/src')])
+        self.container('tagged', labels={c.TASK_LABEL: self.cwd})
+        self.container('shared-parent', mounts=[dict(Type='bind', Source='/tmp')])
+        self.container('sibling-prefix', mounts=[dict(Type='bind', Source=self.cwd + '-other')])
+        c.remove_containers(c.container_plan(self.cwd))
+        self.assertEqual(set(self.containers), {'shared-parent', 'sibling-prefix'})
+
+    def test_same_compose_name_in_other_worktree_blocks_before_mutation(self):
+        self.container('task', self.cwd, 'collision')
+        self.container('other', '/tmp/other', 'collision')
+        with self.assertRaisesRegex(ValueError, 'shared with another worktree'):
+            c.container_plan(self.cwd)
+        self.assertEqual(self.removed, [])
+
+    def test_conflicting_explicit_ownership_does_not_kill_another_project(self):
+        self.container('foreign', '/tmp/other', 'other',
+                       mounts=[dict(Type='bind', Source=self.cwd)])
+        with self.assertRaisesRegex(ValueError, 'conflicting task ownership'):
+            c.container_plan(self.cwd)
+        self.assertEqual(self.removed, [])
+
+    def test_shared_volumes_and_networks_survive_including_stopped_foreign_containers(self):
+        self.container('task', self.cwd, 'task')
+        other = self.container('other', '/tmp/other', 'other',
+                               mounts=[dict(Type='volume', Name='shared-data')])
+        other['State']['Running'] = False
+        other['NetworkSettings']['Networks'] = {'shared-net': {}}
+        self.resource('volume', 'shared-data', 'task')
+        self.resource('network', 'shared-net', 'task')
+        c.remove_containers(c.container_plan(self.cwd))
+        self.assertEqual(self.removed, [('container', 'task')])
+        self.assertIn('shared-data', self.volumes)
+        self.assertIn('shared-net', self.networks)
+
+    def test_tagged_orphan_resources_are_removed_without_existing_container_or_directory(self):
+        self.resource('network', 'orphan-net', task=True)
+        self.resource('volume', 'orphan-data', task=True)
+        c.remove_containers(c.container_plan(self.cwd))
+        self.assertEqual(self.removed, [('network', 'orphan-net'), ('volume', 'orphan-data')])
+
+    def test_volume_recreated_after_inventory_is_not_removed(self):
+        self.resource('volume', 'data', task=True)
+        plans = c.container_plan(self.cwd)
+        self.volumes['data']['CreatedAt'] = '2026-02-01T00:00:00Z'
+        with self.assertRaisesRegex(ValueError, 'volume identity changed'):
+            c.remove_containers(plans)
+        self.assertEqual(self.removed, [])
+
+    def test_remote_docker_is_never_mutated_and_podman_is_forced_local(self):
+        with patch.dict(os.environ, DOCKER_HOST='tcp://example.invalid:2375'):
+            with self.assertRaisesRegex(ValueError, 'local Docker endpoint'):
+                c.container_plan(self.cwd)
+        with patch.object(c.shutil, 'which', side_effect=lambda name: name if name == 'podman' else None):
+            c.container_plan(self.cwd)
+        self.assertTrue(any(call.args[0] == ['podman', '--remote=false'] for call in self.calls.call_args_list))
+        self.assertEqual(self.removed, [])
+
+    def test_docker_context_takes_precedence_and_endpoint_is_pinned(self):
+        self.container('task', self.cwd, 'task')
+        with patch.dict(os.environ, DOCKER_CONTEXT='fixture-local', DOCKER_HOST='tcp://unused.invalid'):
+            plans = c.container_plan(self.cwd)
+        self.assertEqual(plans[0]['runtime'], ['docker', '--host', 'unix:///fixture.sock'])
+        self.assertIn(unittest.mock.call(['docker'], 'context', 'inspect', 'fixture-local',
+            '--format', '{{json .Endpoints.docker.Host}}'), self.calls.call_args_list)
+
+    def test_podman_network_json_and_private_volume_cleanup(self):
+        self.container('task', self.cwd, 'task')
+        self.resource('network', 'task-net', 'task')
+        self.resource('volume', 'task-data', 'task')
+        with patch.object(c.shutil, 'which', side_effect=lambda name: name if name == 'podman' else None):
+            c.remove_containers(c.container_plan(self.cwd))
+        self.assertEqual(self.removed, [('container', 'task'), ('network', 'task-net'), ('volume', 'task-data')])
+
+    def test_missing_cli_with_runtime_socket_is_not_reported_as_clean(self):
+        with patch.object(c.shutil, 'which', return_value=None), patch.object(Path, 'exists', return_value=True):
+            with self.assertRaisesRegex(ValueError, 'cleanup CLI is unavailable'):
+                c.container_plan(self.cwd)
+
+    def test_runtime_failure_is_reported_before_any_deletion(self):
+        self.calls.side_effect = ValueError('runtime unavailable')
+        with self.assertRaisesRegex(ValueError, 'runtime unavailable'):
+            c.container_plan(self.cwd)
+        self.assertEqual(self.removed, [])
+
+    def test_runtime_subprocess_timeout_and_pinned_endpoint_environment(self):
+        with patch.dict(os.environ, DOCKER_CONTEXT='unrelated'), \
+                patch.object(c.subprocess, 'run', return_value=Mock(returncode=1, stderr='runtime unavailable')) as run:
+            with self.assertRaisesRegex(ValueError, 'runtime unavailable'):
+                self.real_runtime_call(['docker', '--host', 'unix:///fixture.sock'], 'container', 'rm', 'task')
+            self.assertEqual(run.call_args.kwargs['timeout'], 25)
+            self.assertNotIn('DOCKER_CONTEXT', run.call_args.kwargs['env'])
 
 
 if __name__ == '__main__':

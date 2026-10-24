@@ -935,6 +935,10 @@ class Worker:
                   'change authentication or touch other projects unless the owner explicitly requested that scope. '
                   'Do not leave background processes running. Earlier bridge-added read-only pilot restrictions are retired; '
                   'honor any explicit read-only instructions from the owner.\n\n'
+                  'Use a separate Compose project with this worktree as its project working directory. '
+                  'Label standalone task containers and private networks/volumes with the container cleanup label below. '
+                  'Issue closure or PR merge removes these task resources, including running containers. '
+                  'Do not assign the task label to shared services or resources.\n\n'
                   'OpenSSH ControlMaster sockets may use ${MURPHY_SSH_CONTROL_DIR}/%C; this private project directory '
                   'is writable in the sandbox. Use ControlMaster auto and a finite ControlPersist (for example 60), '
                   'with the existing authorized host/user and host-key checking. Do not start a manual SSH master '
@@ -956,6 +960,7 @@ class Worker:
                   'Use message for the human-readable question or completion report.\n\n'
                   + 'Configured Git executable: ' + json.dumps(CONFIG.git)
                   + '\nConfigured GitHub CLI executable: ' + json.dumps(CONFIG.gh)
+                  + '\nContainer cleanup label: io.murphy.worktree=' + task['cwd']
                   + '\nRegistered branch: ' + task['branch'] + '\n\nOwner command:\n' + row['prompt'])
         if not task['thread_id'] and task['issue_json']:
             issue = json.loads(task['issue_json'])

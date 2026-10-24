@@ -321,22 +321,43 @@ directory and worktree registration immediately before removal.
 Queued/running/blocked commands, queued continuations and unresolved `unknown` outcomes
 prevent cleanup. Staged, unstaged and untracked work also blocks it. After fresh GitHub
 closure/merge and worktree identity checks, Murphy runs ordinary `git worktree remove`.
-It does not scan `/proc`, systemd or Docker/Podman, fetch branches, or require remote
-ancestry proof. Closing/merging the task is the cleanup decision; process visibility,
-container availability, squash merges and deleted remote branches do not veto it.
+It does not scan `/proc` or systemd, fetch branches, or require remote ancestry proof.
+Squash merges and deleted remote branches do not veto cleanup.
+
+Before removing the directory, Murphy inventories local Docker/Podman resources and
+removes task containers even when they are running. Ownership comes from Compose's
+`com.docker.compose.project.working_dir`, an explicit `io.murphy.worktree` label with the
+absolute task directory, or a bind mount inside that directory. All services and orphan
+containers of an exclusively owned Compose project are included, even without source mounts.
+A conflicting owner or the same Compose project name used by another worktree blocks cleanup
+before any container is removed. A parent-directory mount alone does not establish ownership.
+
+Task containers are removed with `container rm --force --volumes`, followed by their private
+Compose-labelled or explicitly task-labelled networks and named volumes. Resources used by
+other containers, including stopped containers, are retained. Shared/external resources,
+images and unrelated containers are not pruned. The worker instructs task executors to use
+a separate Compose project rooted at their worktree and label standalone containers and private
+networks/volumes with `io.murphy.worktree=<absolute-worktree-path>`; unlabelled resources without
+remaining task ownership evidence cannot be attributed and are not guessed from their names.
+
+Docker is pinned to the inspected local Unix endpoint; Podman uses its local engine.
+An inaccessible detected runtime, missing runtime CLI, ownership conflict or cleanup failure
+keeps the directory and reports the error instead of marking cleanup successful. The exact
+resource plan is persisted before mutation. Interrupted or uncertain removals need explicit
+reconciliation. Already absent worktrees still have their attributable containers cleaned.
+A final inventory must confirm no task resources remain before recording success.
 
 Removal keeps the local task branch and its commits, including commits not on a remote
-branch, plus reports, logs, history and session metadata. It never uses `--force`, stash,
-reset, clean or branch deletion. Git removal errors remain visible for operator action.
-Murphy does not stop or modify external processes or containers.
-External processes and container launches do not share Murphy's lock: operators must avoid
-starting new users of a worktree during cleanup.
+branch, plus reports, logs, history and session metadata. Worktree removal never uses
+`--force`, stash, reset, clean or branch deletion. Container removal explicitly uses force
+so a running task container cannot keep a closed task alive. External resource launches do
+not share Murphy's lock; do not start new task services during retirement.
 
 `murphy status` includes tasks with `cleanup_json` recording the result or blocking reason.
 Blocked cleanup stays visible below the task as `Sprzątanie: ...`, preserving the task's
 actual result (for example `ZAKOŃCZONE`). Repeated identical reasons do not generate GitHub
-comments or log messages. Reports, logs, command outcomes and session bindings remain intact after removal. A persisted removal
-marker prevents repeated deletion after restart; an interrupted removal or error after
+comments or log messages. Reports, logs, command outcomes and session bindings remain intact
+after removal. A persisted removal marker prevents repeated deletion after restart; an interrupted removal or error after
 invoking Git removal retains `removing` and requires explicit operator reconciliation.
 No automatic retry guesses whether that operation succeeded.
 
