@@ -265,7 +265,7 @@ immediately after upgrading.
 
 Closed issues, closed/merged PRs and confirmed deleted items disappear from the default view,
 with their count shown as `zakończone` in the header.
-This is presentation only: commands, reports, worktrees and sessions are retained, and
+Commands, reports and sessions are retained; automatic worktrees follow the cleanup rules below.
 `murphy status` still includes the full command history. Queued/running commands and blocked or
 unknown outcomes are never hidden or automatically resolved by this cache. Closure is based
 on the tracked issue/PR itself; merging a separate PR does not imply its issue is closed.
@@ -301,6 +301,44 @@ murphy resume
 ```
 
 Resolution changes bookkeeping only. A branch/worktree creation plan is persisted before creation. Uncertain creation preserves the plan and files. `run --once` returns 2 if unknown outcomes remain. Publication failures retry only reports, with an execution marker reconciling an uncertain POST; they never repeat model work.
+
+### Automatic worktree cleanup
+
+The coordinator evaluates automatic task worktrees during the existing five-minute GitHub
+refresh, under its worker lock. All registered aliases must have fresh, explicit states in
+that refresh; cached closure, missing responses, HTTP 404/410 and API errors cannot authorize
+removal. A closed original issue or merged PR qualifies a task. A merged PR may qualify its
+still-open original issue, but another open alias or branch PR blocks cleanup. Related PRs
+are checked with an additional paginated GitHub read for each automatic task in the batch.
+No model calls or separate service are involved.
+
+Murphy removes only worktrees whose creation is recorded by this installation. Older tasks
+need their durable automatic-creation plan and saved Git checkpoint as evidence; paths and
+branch names alone are insufficient. Manually registered worktrees and the source checkout
+are excluded. Git must still confirm the saved source, branch, common directory, linked Git
+directory and worktree registration immediately before removal.
+
+Queued/running/blocked commands, queued continuations and unresolved `unknown` outcomes
+prevent cleanup. Staged, unstaged and untracked work also blocks it. A fresh origin fetch
+and remote branch advertisement must prove that HEAD and its ancestors remain on a remote
+branch; stale tracking refs do not suffice. Squash merges followed by branch deletion may
+therefore require operator inspection even when the code was merged.
+
+Murphy checks Linux process working directories, roots, open files, memory maps and command
+lines, plus Docker/Podman container mounts (including stopped containers that could restart).
+Those CLIs are optional when no runtime is detected. Permission errors, an inaccessible
+runtime or failed inspection block removal. Murphy never stops or changes containers.
+Cleanup uses only `git worktree remove`, without `--force`, stash, reset, clean or branch deletion.
+External processes and container launches do not share Murphy's lock: operators must avoid
+starting new users of a worktree during cleanup.
+
+`murphy status` includes tasks with `cleanup_json` recording the result or blocking reason.
+Blocked cleanup stays visible in the monitor as `CLEANUP`, with the reason below the task;
+repeated identical reasons do not generate GitHub comments or log messages. Reports, logs,
+command outcomes and session bindings remain intact after removal. A persisted removal
+marker prevents repeated deletion after restart; an interrupted removal requires explicit
+operator reconciliation. Reopening an issue or submitting `continue` never recreates a
+removed worktree: the command fails with instructions to inspect and register a new task.
 
 ## State, configuration and execution scope
 
@@ -352,6 +390,7 @@ Existing scoped prototype databases and saved sessions are not migrated into the
 python3 tests/test_bridge.py
 python3 tests/test_manager.py
 python3 tests/test_auth.py
+python3 tests/test_cleanup.py
 python3 -m venv .venv
 .venv/bin/python -m pip install 'build==1.2.2.post1'
 .venv/bin/python tests/check_package.py

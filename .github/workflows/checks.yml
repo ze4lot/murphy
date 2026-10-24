@@ -29,5 +29,6 @@ jobs:
       - run: python tests/test_bridge.py
       - run: python tests/test_manager.py
       - run: python tests/test_auth.py
+      - run: python tests/test_cleanup.py
       - run: python tests/check_package.py
       - run: git diff --check

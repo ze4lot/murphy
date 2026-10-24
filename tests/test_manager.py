@@ -91,6 +91,8 @@ class ManagerTests(unittest.TestCase):
             return {'id': 3001, 'login': 'example-owner', 'type': 'User'}
         if path == 'repos/' + repository:
             return self.repos[repository]
+        if path.startswith('repos/' + repository + '/pulls?state=all&head='):
+            return []
         prefix = 'repos/' + repository + '/issues'
         comments = self.comments[repository]
         if path.startswith(prefix + '/comments?sort=created&direction=desc'):
@@ -614,6 +616,40 @@ class ManagerTests(unittest.TestCase):
         state.finish(2, 'succeeded', 'Done')
         self.manager.sync_queue()
         self.assertEqual({row['id'] for row in monitor.snapshot(self.manager.directory)['commands']}, {1, 2})
+
+    def test_cleanup_block_is_visible_for_closed_task_without_changing_outcome(self):
+        _, state, _ = self.add_project('one', 1)
+        self.manager.register('example/one', 'manual', self.root / 'one', 'main', [7])
+        ident = state.enqueue('manual', 'start', 'Work', item=7)
+        state.finish(ident, 'succeeded', 'Preserved report')
+        with state.db:
+            state.set('monitor_issues', json.dumps({'7': {'state': 'CLOSED', 'checked': 1}}))
+            state.db.execute('UPDATE tasks SET cleanup_json=?',
+                             (json.dumps({'state': 'blocked', 'reason': 'docker container mounts worktree'}),))
+        self.manager.sync_queue()
+        snapshot = monitor.snapshot(self.manager.directory)
+        self.assertEqual(len(snapshot['commands']), 1)
+        self.assertEqual(snapshot['hidden_closed'], 0)
+        self.assertIn('docker container mounts worktree', monitor.render(snapshot, width=120, height=30))
+        self.assertEqual(state.row(ident)['detail'], 'Preserved report')
+        self.assertEqual(json.loads(self.manager.status()['tasks'][0]['cleanup_json'])['state'], 'blocked')
+
+    def test_cleanup_refresh_includes_all_aliases_and_passes_only_fresh_results(self):
+        from murphy import cleanup
+        _, state, worker = self.add_project('one', 1)
+        self.manager.register('example/one', 'manual', self.root / 'one', 'main', [7, 8])
+        ident = state.enqueue('manual', 'start', 'Work', item=7)
+        state.finish(ident, 'succeeded', 'Done')
+        with state.db:
+            state.db.execute('UPDATE tasks SET automatic_json=?', ('{"proof": "fixture"}',))
+        fresh = {'7': {'state': 'CLOSED'}, '8': {'state': 'OPEN'}}
+        with patch.object(worker.github, 'issue_states', return_value=fresh) as api, \
+                patch.object(cleanup, 'retire') as retire:
+            self.manager.refresh_issue_states()
+            self.assertEqual(api.call_args.args[0], [7, 8])
+            self.assertEqual(retire.call_args.args[2], fresh)
+            self.manager.refresh_issue_states()
+            self.assertEqual(retire.call_count, 1)
 
     def test_issue_status_refresh_batches_deduplicates_and_persists_ttl(self):
         _, state, worker = self.add_project('one', 1)
