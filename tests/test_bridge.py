@@ -500,12 +500,9 @@ class BridgeTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 b.turn_result(value)
 
-    def test_waiting_turn_keeps_checkpoint_and_frees_the_serial_slot(self):
-        other_cwd = Path(self.temp.name) / 'other-task'
-        b.git(str(self.cwd), 'worktree', 'add', '-qb', 'codex/other-task', str(other_cwd))
-        self.state.register('other', other_cwd, 'codex/other-task')
-        first = self.state.enqueue('a', 'start', 'ASK_OWNER WRITE_TASK_FILE')
-        second = self.state.enqueue('other', 'start', 'SUCCESS_WITH_QUESTION_MARK')
+    def test_waiting_turn_keeps_session_and_frees_the_serial_slot(self):
+        first = self.state.enqueue('a', 'start', 'ASK_OWNER')
+        second = self.state.enqueue('b', 'start', 'SUCCESS_WITH_QUESTION_MARK')
         self.execute()
         self.assertEqual(self.state.row(first)['state'], 'waiting_for_user')
         self.assertEqual(self.state.setting('paused'), '0')
@@ -518,7 +515,7 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(self.state.row(reply)['state'], 'succeeded')
         self.assertEqual(self.state.row(reply)['thread_id'], self.state.row(first)['thread_id'])
         self.assertNotEqual(self.state.row(second)['thread_id'], self.state.row(first)['thread_id'])
-        self.assertEqual((self.cwd / 'task.txt').read_text(), 'task change\ntask change\n')
+        self.assertEqual((self.cwd / 'task.txt').read_text(), 'task change\n')
 
     def test_malformed_turn_result_is_unknown_and_never_guessed_from_question_text(self):
         first = self.state.enqueue('a', 'start', 'INVALID_TURN_RESULT')
@@ -697,9 +694,11 @@ class BridgeTests(unittest.TestCase):
             self.assertIn('On failure, inspect the relevant stderr or log excerpt', event['prompt'])
             self.assertIn('a missing final result or log text alone is never evidence of PASS', event['prompt'])
             self.assertIn('Configured GitHub CLI executable:', event['prompt'])
-            self.assertIn('Container cleanup label: io.murphy.worktree=' + str(self.cwd), event['prompt'])
-            self.assertIn('Closing the original issue removes these task resources', event['prompt'])
-            self.assertNotIn('Issue closure or PR merge removes', event['prompt'])
+            self.assertIn('same local development database', event['prompt'])
+            self.assertIn('including migrations, writes and test data, are authorized', event['prompt'])
+            self.assertIn('does not authorize stopping or deleting', event['prompt'])
+            self.assertNotIn('io.murphy.worktree', event['prompt'])
+            self.assertNotIn('Use a separate Compose project', event['prompt'])
             self.assertIn('--output-schema', args)
             schema = json.loads(Path(args[args.index('--output-schema') + 1]).read_text())
             self.assertEqual(schema, b.TURN_SCHEMA)
@@ -911,25 +910,25 @@ class BridgeTests(unittest.TestCase):
 
     def setup_autostart(self, number=500, body='Reasoning: high\n\nRead HEAD and remember ACORN.'):
         subprocess.run([b.CONFIG.git, '-C', str(self.cwd), 'update-ref', 'refs/remotes/origin/main', 'HEAD'], check=True)
-        self.state.configure_autostart(self.cwd, Path(self.temp.name) / 'automatic')
+        self.state.configure_autostart(self.cwd)
         self.api.issues[number] = {'number': number, 'title': 'A new issue', 'body': body,
                                    'updated_at': '2026-10-15T12:00:00Z'}
         self.worker.github = self.api
         original = b.git
-        # Exercise real Git worktree creation; only network fetch is replaced by a fixture ref.
+        # Exercise real Git branch switching; only network fetch is replaced by a fixture ref.
         return patch.object(b, 'git', side_effect=lambda cwd, *args: '' if args[0] == 'fetch' else original(cwd, *args))
 
     def test_enabling_autostart_does_not_execute_preexisting_unknown_commands(self):
         self.setup_autostart()
         with self.state.db:
             self.state.db.execute("DELETE FROM settings WHERE key='autostart_baseline'")
-        self.state.configure_autostart(self.cwd, Path(self.temp.name) / 'automatic', baseline=110)
+        self.state.configure_autostart(self.cwd, baseline=110)
         self.assertEqual(self.state.ingest([comment(105, item=500)]), [])
         self.assertEqual(len(self.state.ingest([comment(111, item=500)])), 1)
-        self.state.configure_autostart(self.cwd, Path(self.temp.name) / 'automatic', baseline=999)
+        self.state.configure_autostart(self.cwd, baseline=999)
         self.assertEqual(self.state.setting('autostart_baseline'), '110')
 
-    def test_new_issue_start_creates_worktree_session_and_freezes_reasoning(self):
+    def test_new_issue_start_uses_project_checkout_and_freezes_reasoning(self):
         fetch = self.setup_autostart(body='Reasoning: medium\n\nRead HEAD and remember ACORN.')
         self.api.data = {101: comment(101, '/murphy start\nRead this issue.', item=500),
                          102: comment(102, '/murphy continue\nRecall the issue context.', item=500)}
@@ -943,8 +942,8 @@ class BridgeTests(unittest.TestCase):
         task = self.state.db.execute("SELECT * FROM tasks WHERE name='issue-500'").fetchone()
         self.assertEqual(task['branch'], 'codex/issue-500-murphy')
         self.assertEqual(task['reasoning'], 'medium')
-        self.assertEqual(task['cwd'], str(Path(self.temp.name) / 'automatic/issue-500'))
-        self.assertEqual(b.git(str(self.cwd), 'branch', '--show-current'), 'codex/pilot')
+        self.assertEqual(task['cwd'], str(self.cwd))
+        self.assertEqual(b.git(str(self.cwd), 'branch', '--show-current'), 'codex/issue-500-murphy')
         self.assertEqual(self.state.row(first)['state'], 'succeeded')
         self.assertEqual(self.state.row(second)['state'], 'succeeded')
         self.assertEqual(self.state.row(first)['thread_id'], self.state.row(second)['thread_id'])
@@ -958,7 +957,7 @@ class BridgeTests(unittest.TestCase):
                 self.assertNotIn('Changed after the start.', event['prompt'])
         self.assertEqual(self.state.ingest(list(self.api.data.values())), [])
 
-    def test_private_worker_creates_container_readable_worktree_and_executor_files(self):
+    def test_private_worker_creates_container_readable_executor_files_in_project_checkout(self):
         (self.cwd / 'public').mkdir()
         (self.cwd / 'public/index.txt').write_text('tracked source')
         b.git(str(self.cwd), 'add', 'public/index.txt')
@@ -975,7 +974,7 @@ class BridgeTests(unittest.TestCase):
         finally:
             os.umask(previous)
         self.assertEqual(self.state.row(ident)['state'], 'succeeded')
-        cwd = Path(self.temp.name) / 'automatic/issue-500'
+        cwd = self.cwd
         for path in (cwd, cwd / 'public', cwd / 'runtime-directory'):
             self.assertEqual(path.stat().st_mode & 0o777, 0o755)
         for path in (cwd / 'public/index.txt', cwd / 'runtime-directory/file.txt'):
@@ -1044,6 +1043,117 @@ class BridgeTests(unittest.TestCase):
         task = self.state.db.execute("SELECT reasoning FROM tasks WHERE name='issue-500'").fetchone()
         self.assertEqual(task['reasoning'], 'high')
 
+    def test_queued_continuation_accepts_own_dirty_checkpoint_in_project_checkout(self):
+        fetch = self.setup_autostart()
+        self.api.data = {101: comment(101, '/murphy start\nWRITE_TASK_FILE', item=500),
+                         102: comment(102, '/murphy continue\nWRITE_TASK_FILE', item=500)}
+        first, second = self.state.ingest(list(self.api.data.values()))
+        with fetch as calls:
+            self.execute()
+            self.execute()
+        self.assertEqual(self.state.row(second)['state'], 'succeeded', self.state.row(second)['detail'])
+        self.assertEqual(self.state.row(first)['thread_id'], self.state.row(second)['thread_id'])
+        self.assertEqual((self.cwd / 'task.txt').read_text(), 'task change\ntask change\n')
+        self.assertFalse(any(call.args[1] in ('worktree', 'clone') for call in calls.call_args_list))
+        for ident in (first, second):
+            row = self.state.row(ident)
+            event = json.loads((self.state.directory / (row['execution_id'] + '.jsonl')).read_text().splitlines()[0])
+            self.assertEqual(event['cwd'], str(self.cwd))
+
+    def test_clean_tasks_switch_a_b_a_in_same_checkout_and_resume_saved_session(self):
+        fetch = self.setup_autostart()
+        self.api.issues[501] = dict(self.api.issues[500], number=501)
+        self.api.data = {101: comment(101, '/murphy start\nCOMMIT_TASK_FILE', item=500),
+                         102: comment(102, '/murphy start\nread', item=501),
+                         103: comment(103, '/murphy continue\nWRITE_TASK_FILE', item=500)}
+        first, second, reply = self.state.ingest(list(self.api.data.values()))
+        with fetch:
+            self.execute()
+            head = b.git(str(self.cwd), 'rev-parse', 'HEAD')
+            self.execute()
+            self.assertEqual(b.git(str(self.cwd), 'branch', '--show-current'), 'codex/issue-501-murphy')
+            self.assertFalse((self.cwd / 'task.txt').exists())
+            self.execute()
+        self.assertEqual(self.state.row(reply)['state'], 'succeeded', self.state.row(reply)['detail'])
+        self.assertEqual(self.state.row(reply)['thread_id'], self.state.row(first)['thread_id'])
+        self.assertNotEqual(self.state.row(second)['thread_id'], self.state.row(first)['thread_id'])
+        self.assertEqual(b.git(str(self.cwd), 'branch', '--show-current'), 'codex/issue-500-murphy')
+        self.assertEqual(b.git(str(self.cwd), 'rev-parse', 'HEAD'), head)
+        self.assertEqual((self.cwd / 'task.txt').read_text(), 'task change\ntask change\n')
+        self.assertEqual({row[0] for row in self.state.db.execute("SELECT cwd FROM tasks WHERE name LIKE 'issue-%'")},
+                         {str(self.cwd)})
+
+    def test_dirty_task_blocks_another_issue_without_switching_or_stashing(self):
+        fetch = self.setup_autostart()
+        self.api.issues[501] = dict(self.api.issues[500], number=501)
+        self.api.data = {101: comment(101, '/murphy start\nASK_OWNER WRITE_TASK_FILE', item=500),
+                         102: comment(102, '/murphy start', item=501)}
+        first, second = self.state.ingest(list(self.api.data.values()))
+        with fetch:
+            self.execute()
+            self.execute()
+        self.assertEqual(self.state.row(first)['state'], 'waiting_for_user')
+        self.assertEqual(self.state.row(second)['state'], 'blocked')
+        self.assertEqual(b.git(str(self.cwd), 'branch', '--show-current'), 'codex/issue-500-murphy')
+        self.assertEqual((self.cwd / 'task.txt').read_text(), 'task change\n')
+        self.assertEqual(b.git(str(self.cwd), 'stash', 'list'), '')
+        self.assertEqual(len(list(self.state.directory.glob('*.jsonl'))), 1)
+
+    def test_continuation_rejects_external_changes_to_task_branch_before_switch(self):
+        fetch = self.setup_autostart()
+        self.api.data = {101: comment(101, item=500)}
+        self.state.ingest(list(self.api.data.values()))
+        with fetch:
+            self.execute()
+            b.git(str(self.cwd), '-c', 'user.name=Owner', '-c', 'user.email=owner@example.invalid',
+                  'commit', '--allow-empty', '-qm', 'external work')
+            external = b.git(str(self.cwd), 'rev-parse', 'HEAD')
+            b.git(str(self.cwd), 'switch', 'codex/pilot')
+            self.api.data[102] = comment(102, '/murphy continue', item=500)
+            self.state.ingest(list(self.api.data.values()))
+            self.execute()
+        self.assertEqual(self.state.row(2)['state'], 'unknown')
+        self.assertIn('external commits preserved', self.state.row(2)['detail'])
+        self.assertEqual(b.git(str(self.cwd), 'branch', '--show-current'), 'codex/pilot')
+        self.assertEqual(b.git(str(self.cwd), 'rev-parse', 'refs/heads/codex/issue-500-murphy'), external)
+
+    def test_ignored_local_file_is_not_overwritten_when_switching_branches(self):
+        (self.cwd / 'local.txt').write_text('tracked on task branch')
+        b.git(str(self.cwd), 'add', 'local.txt')
+        b.git(str(self.cwd), '-c', 'user.name=Owner', '-c', 'user.email=owner@example.invalid',
+              'commit', '-qm', 'task file')
+        self.state.register('with-file', self.cwd, 'codex/pilot')
+        b.git(str(self.cwd), 'switch', '--orphan', 'other')
+        b.git(str(self.cwd), '-c', 'user.name=Owner', '-c', 'user.email=owner@example.invalid',
+              'commit', '--allow-empty', '-qm', 'other branch')
+        (self.cwd / '.git/info/exclude').write_text('local.txt\n')
+        (self.cwd / 'local.txt').write_text('local environment data')
+        ident = self.state.enqueue('with-file', 'start', 'read')
+        self.execute()
+        self.assertEqual(self.state.row(ident)['state'], 'unknown')
+        self.assertEqual((self.cwd / 'local.txt').read_text(), 'local environment data')
+        self.assertEqual(b.git(str(self.cwd), 'branch', '--show-current'), 'other')
+
+    def test_legacy_worktree_and_session_are_preserved_but_not_executed(self):
+        legacy = Path(self.temp.name) / 'legacy'
+        b.git(str(self.cwd), 'worktree', 'add', '-qb', 'codex/legacy', str(legacy))
+        self.state.register('legacy', legacy, 'codex/legacy', [500])
+        self.state.configure_autostart(self.cwd)
+        (legacy / 'unfinished.txt').write_text('preserve legacy work')
+        thread = '11111111-1111-4111-8111-111111111111'
+        with self.state.db:
+            self.state.db.execute("UPDATE tasks SET thread_id=? WHERE name='legacy'", (thread,))
+        ident = self.state.enqueue('legacy', 'continue', 'read')
+        with patch.object(self.worker, 'run_codex') as model:
+            self.execute()
+            model.assert_not_called()
+        self.assertEqual(self.state.row(ident)['state'], 'failed')
+        self.assertIn('legacy checkout', self.state.row(ident)['detail'])
+        self.assertEqual((legacy / 'unfinished.txt').read_text(), 'preserve legacy work')
+        self.assertEqual(self.state.db.execute("SELECT thread_id FROM tasks WHERE name='legacy'").fetchone()[0], thread)
+        with self.assertRaisesRegex(ValueError, 'configured project checkout'):
+            self.state.register('another-legacy', legacy, 'codex/legacy')
+
     def test_reasoning_metadata_is_literal_and_unambiguous(self):
         self.assertEqual(b.issue_reasoning('Reasoning: high'), 'high')
         self.assertEqual(b.issue_reasoning('Reasoning: XHIGH\r\nText'), 'xhigh')
@@ -1074,19 +1184,6 @@ class BridgeTests(unittest.TestCase):
         self.assertFalse((Path(self.temp.name) / 'automatic').exists())
         self.assertFalse(list(self.state.directory.glob('*.jsonl')))
 
-    def test_autostart_never_overwrites_an_existing_directory(self):
-        fetch = self.setup_autostart()
-        directory = Path(self.temp.name) / 'automatic/issue-500'
-        directory.mkdir(parents=True)
-        (directory / 'human.txt').write_text('preserve')
-        self.api.data[101] = comment(101, item=500)
-        ident = self.state.ingest(list(self.api.data.values()))[0]
-        with fetch:
-            self.execute()
-        self.assertEqual(self.state.row(ident)['state'], 'failed')
-        self.assertEqual((directory / 'human.txt').read_text(), 'preserve')
-        self.assertFalse(list(self.state.directory.glob('*.jsonl')))
-
     def test_autostart_never_replaces_an_existing_issue_branch(self):
         fetch = self.setup_autostart()
         subprocess.run([b.CONFIG.git, '-C', str(self.cwd), 'branch', 'codex/issue-500-existing'], check=True)
@@ -1098,11 +1195,11 @@ class BridgeTests(unittest.TestCase):
         self.assertIn('already exists', self.state.row(ident)['detail'])
         self.assertFalse(list(self.state.directory.glob('*.jsonl')))
 
-    def test_failure_after_worktree_creation_preserves_plan_and_pauses(self):
+    def test_failure_after_branch_creation_preserves_plan_and_pauses(self):
         fetch = self.setup_autostart()
         self.api.data[101] = comment(101, item=500)
         ident = self.state.ingest(list(self.api.data.values()))[0]
-        with fetch, patch.object(self.state, 'register', side_effect=RuntimeError('process stopped after creating worktree')):
+        with fetch, patch.object(self.state, 'register', side_effect=RuntimeError('process stopped after creating branch')):
             self.execute()
         row = self.state.row(ident)
         self.assertEqual(row['state'], 'unknown')

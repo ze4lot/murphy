@@ -36,12 +36,12 @@ def main():
     # Keep the sibling outside system temp, which the workspace profile permits writing.
     with tempfile.TemporaryDirectory(prefix='murphy-sandbox-check-', dir=Path.home()) as directory:
         root = Path(directory)
-        source, task = root / 'source', root / 'task'
-        subprocess.run(['git', 'init', '-q', str(source)], check=True)
-        subprocess.run(['git', '-C', str(source), '-c', 'user.name=Test Bot',
-                        '-c', 'user.email=bot@example.invalid', 'commit', '--allow-empty', '-qm', 'fixture'], check=True)
+        source, task = root / 'unrelated-project', root / 'project'
+        source.mkdir()
         (source / 'human.txt').write_text('preserve')
-        subprocess.run(['git', '-C', str(source), 'worktree', 'add', '-qb', 'codex/check', str(task)], check=True)
+        subprocess.run(['git', 'init', '-q', '-b', 'codex/check', str(task)], check=True)
+        subprocess.run(['git', '-C', str(task), '-c', 'user.name=Test Bot',
+                        '-c', 'user.email=bot@example.invalid', 'commit', '--allow-empty', '-qm', 'fixture'], check=True)
         subprocess.run(['git', '-C', str(task), 'remote', 'add', 'origin',
                         'https://github.com/example/project.git'], check=True)
         if args.separate_account:
@@ -81,8 +81,8 @@ try:
 except OSError as error:
     assert error.errno in (errno.EACCES,errno.EPERM,errno.EROFS),error
 else:
-    raise AssertionError('Sibling source checkout unexpectedly writable')
-print('PASS: worktree edit, commit, network access, sibling checkout protection')
+    raise AssertionError('Unrelated project unexpectedly writable')
+print('PASS: local checkout edit, commit, network access, unrelated project protection')
 '''
         try:
             env = environment(bridge.CONFIG)

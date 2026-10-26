@@ -32,9 +32,9 @@ def main():
     actions = projects.add_subparsers(dest='project_action', required=True)
     actions.add_parser('available', help='List repositories accessible to your account')
     actions.add_parser('list', help='List connected projects')
-    add = actions.add_parser('add', help='Connect a repository; clone it if needed')
+    add = actions.add_parser('add', help='Connect an existing local project checkout')
     add.add_argument('repository')
-    add.add_argument('--checkout', help='Use an existing local checkout without switching or cleaning it')
+    add.add_argument('--checkout', required=True, help='Existing local checkout used by all tasks in this project')
     add.add_argument('--base', help='Task base branch (default: GitHub default branch)')
     add.add_argument('--model', help='Optional Codex model for new tasks')
     add.add_argument('-i', '--interval', type=int, default=60,

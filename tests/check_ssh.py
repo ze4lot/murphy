@@ -170,13 +170,13 @@ Host local-test
         outside.pop('MURPHY_SSH_CONTROL_DIR', None)
         ordinary = run(['ssh', '-F', client, '-G', 'local-test'], env=outside, capture_output=True, text=True)
         assert 'controlmaster false' in ordinary.stdout, ordinary.stdout
-        source, task = root / 'source', root / 'task'
-        run(['git', 'init', '-q', source])
-        run(['git', '-C', source, '-c', 'user.name=Test Bot', '-c', 'user.email=bot@example.invalid',
-             'commit', '--allow-empty', '-qm', 'fixture'])
-        run(['git', '-C', source, 'remote', 'add', 'origin', 'https://github.com/example/project.git'])
-        run(['git', '-C', source, 'worktree', 'add', '-qb', 'codex/check', task])
+        source, task = root / 'unrelated-project', root / 'project'
+        source.mkdir()
         (source / 'human.txt').write_text('preserve')
+        run(['git', 'init', '-q', '-b', 'codex/check', task])
+        run(['git', '-C', task, '-c', 'user.name=Test Bot', '-c', 'user.email=bot@example.invalid',
+             'commit', '--allow-empty', '-qm', 'fixture'])
+        run(['git', '-C', task, 'remote', 'add', 'origin', 'https://github.com/example/project.git'])
         b.CONFIG = b.Config('example/project', 1001, 2001, 3001, 'example-owner')
         before = b.checkout(str(task))
         directory = b.ssh_control_directory(before)

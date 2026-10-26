@@ -41,7 +41,7 @@ thread = sys.argv[sys.argv.index('resume') + 1] if 'resume' in sys.argv else str
 def emit(kind, **data):
     print(json.dumps({'type': kind, **data}), flush=True)
 
-emit('thread.started', thread_id=thread, argv=sys.argv, prompt=prompt)
+emit('thread.started', thread_id=thread, argv=sys.argv, prompt=prompt, cwd=os.getcwd())
 emit('turn.started', turn_id=str(uuid.uuid4()))
 if 'CHECK_WORKSPACE_MODES' in prompt:
     Path('runtime-directory').mkdir(exist_ok=True)
@@ -83,6 +83,8 @@ if 'WAIT_FOR_TEST_RELEASE' in prompt:
     Path('execution-started').write_text(str(os.getpid()))
     while not Path('execution-release').exists():
         time.sleep(0.05)
+    Path('execution-started').unlink()
+    Path('execution-release').unlink()
 if any(marker in prompt for marker in ('WRITE_TASK_FILE', 'COMMIT_TASK_FILE', 'COMMIT_EXECUTOR_FILE')):
     if 'default_permissions="murphy"' not in sys.argv or any(arg in sys.argv for arg in ('read-only', 'danger-full-access')):
         emit('error', message='Writable task permissions were not passed')

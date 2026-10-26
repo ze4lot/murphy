@@ -297,6 +297,8 @@ class Manager:
     def add(self, repository, checkout=None, base=None, model=None, interval=60):
         if type(interval) is not int or interval < 1:
             raise ValueError('Project poll interval must be a whole number of seconds >= 1.')
+        if not checkout:
+            raise ValueError('Use --checkout PATH to connect your existing local project checkout; Murphy does not clone repositories.')
         self.initialized()
         if not b.re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]+', repository):
             raise ValueError('Use a GitHub owner/repository name.')
@@ -323,30 +325,19 @@ class Manager:
         try:
             with project_config(config):
                 github = ProjectGitHub(self, repo['id'])
-                # Capture activation before cloning; never import historical commands.
+                # Capture activation without importing historical commands.
                 if state.setting('baseline') is None:
                     state.bind_config(config)
                     state.initialize(github)
                 else:
                     state.bind_config(config)
-                if checkout:
-                    source = Path(checkout).expanduser().resolve()
-                else:
-                    source = self.directory / 'checkouts' / str(repo['id'])
-                    if source.exists():
-                        raise ValueError('Managed checkout already exists; inspect it and use --checkout explicitly.')
-                    source.parent.mkdir(parents=True, exist_ok=True)
-                    # The executor's context must also reach gh's Git subprocess.
-                    self.account.verify()
-                    subprocess.run([config.gh, 'repo', 'clone', 'https://github.com/' + repository, str(source)],
-                                   check=True, timeout=300, env=auth.environment(config))
+                source = Path(checkout).expanduser().resolve()
                 b.checkout(str(source))
                 b.git(str(source), 'check-ref-format', '--branch', base)
                 b.git(str(source), 'fetch', 'origin', f'+refs/heads/{base}:refs/remotes/origin/{base}')
                 b.git(str(source), 'rev-parse', '--verify', f'refs/remotes/origin/{base}^{{commit}}')
                 latest = github.latest()
-                state.configure_autostart(source, state.directory / 'worktrees', base, model,
-                                          latest['id'] if latest else 0)
+                state.configure_autostart(source, base, model, latest['id'] if latest else 0)
             with self.db:
                 self.db.execute('INSERT INTO projects (id, repository, config, poll_interval) VALUES (?, ?, ?, ?)',
                                 (repo['id'], repository, json.dumps(asdict(config)), interval))
@@ -437,20 +428,13 @@ class Manager:
 
     def refresh_issue_states(self):
         """Optional monitor metadata: at most one batch per project every five minutes."""
-        from .cleanup import automatic_tasks, retire
         clock, checked = time.monotonic(), time.time()
         for project, (config, state, worker) in self.projects.items():
-            first_refresh = project not in self.last_issue_check
             if clock - self.last_issue_check.get(project, float('-inf')) < 300:
                 continue
             self.last_issue_check[project] = clock  # Failures back off too.
             cache = issue_cache(state.setting('monitor_issues'))
             numbers = set()
-            for task, _ in automatic_tasks(state):
-                for alias in state.db.execute('SELECT number FROM items WHERE task=?', (task['name'],)):
-                    saved = cache.get(str(alias[0]), {})
-                    if first_refresh or checked - saved.get('attempted', 0) >= 300:
-                        numbers.add(alias[0])
             for row in task_commands(state.db):
                 if not row['item'] or row['state'] in ALWAYS_VISIBLE:
                     continue
@@ -467,8 +451,6 @@ class Manager:
                 with project_config(config):
                     updates = worker.github.issue_states(numbers)
             except (RuntimeError, OSError, subprocess.SubprocessError, json.JSONDecodeError) as error:
-                with project_config(config):
-                    retire(state, worker.github, {}, numbers)
                 print(f'Issue status refresh deferred; cached states retained: {error}', file=sys.stderr)
                 continue
             for number in numbers:
@@ -477,8 +459,6 @@ class Manager:
                 cache[key] = dict(updates[key], checked=checked, attempted=checked) if key in updates else dict(saved, attempted=checked)
             with state.db:
                 state.set('monitor_issues', json.dumps(cache))
-            with project_config(config):
-                retire(state, worker.github, updates, numbers)
 
     def drain_orphans(self):
         # A dead executor's detached children are adopted by this subreaper.
