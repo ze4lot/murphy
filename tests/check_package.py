@@ -13,7 +13,7 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parent.parent
 VERSION = '0.1.0'
-MODULES = {'murphy/' + name for name in ('__init__.py', '__main__.py', 'auth.py', 'bridge.py', 'cleanup.py', 'cli.py', 'manager.py', 'monitor.py')}
+MODULES = {'murphy/' + name for name in ('__init__.py', '__main__.py', 'auth.py', 'bridge.py', 'cli.py', 'manager.py', 'monitor.py')}
 SOURCE = MODULES | {'README.md', 'LICENSE', 'CHANGELOG.md', 'RELEASE.md', 'bridge.py', 'config.example.json',
                     'pyproject.toml', 'MANIFEST.in', 'build_backend.py', 'setup.cfg'}
 SOURCE |= {'tests/' + path.name for path in (ROOT / 'tests').glob('*.py')}

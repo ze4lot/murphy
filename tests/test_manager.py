@@ -18,7 +18,6 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from murphy import bridge as b
 from murphy import cli
-from murphy import cleanup
 from murphy import monitor
 from murphy.manager import Account, Manager
 
@@ -41,9 +40,6 @@ class ManagerTests(unittest.TestCase):
         self.manager = Manager(self.root / 'state')
         self.manager.timeout = 3
         self.addCleanup(self.manager.close)
-        containers = patch.object(cleanup, 'container_plan', return_value=[])
-        containers.start()
-        self.addCleanup(containers.stop)
         account_api = patch.object(Account, 'api', autospec=True, side_effect=self.account_api)
         account_api.start()
         self.addCleanup(account_api.stop)
@@ -621,44 +617,55 @@ class ManagerTests(unittest.TestCase):
         self.manager.sync_queue()
         self.assertEqual({row['id'] for row in monitor.snapshot(self.manager.directory)['commands']}, {1, 2})
 
-    def test_cleanup_block_is_visible_for_closed_task_without_changing_outcome(self):
-        _, state, _ = self.add_project('one', 1)
-        self.manager.register('example/one', 'manual', self.root / 'one', 'main', [7])
-        ident = state.enqueue('manual', 'start', 'Work', item=7)
-        state.finish(ident, 'succeeded', 'Preserved report')
-        with state.db:
-            state.set('monitor_issues', json.dumps({'7': {'state': 'CLOSED', 'checked': 1}}))
-            state.db.execute('UPDATE tasks SET cleanup_json=?',
-                             (json.dumps({'state': 'blocked', 'reason': 'git worktree remove failed'}),))
-        self.manager.sync_queue()
-        snapshot = monitor.snapshot(self.manager.directory)
-        self.assertEqual(len(snapshot['commands']), 1)
-        self.assertEqual(snapshot['hidden_closed'], 0)
-        rendered = monitor.render(snapshot, width=120, height=30)
-        self.assertIn('ZAKOŃCZONE', rendered)
-        self.assertIn('Sprzątanie: git worktree remove failed', rendered)
-        self.assertNotIn('CLEANUP', rendered)
-        self.assertEqual(state.row(ident)['detail'], 'Preserved report')
-        self.assertEqual(json.loads(self.manager.status()['tasks'][0]['cleanup_json'])['state'], 'blocked')
-
-    def test_removed_cleanup_hides_closed_history_but_interrupted_cleanup_stays_visible(self):
+    def test_legacy_cleanup_records_do_not_hold_closed_history_visible(self):
         _, state, _ = self.add_project('one', 1)
         self.manager.register('example/one', 'manual', self.root / 'one', 'main', [7])
         ident = state.enqueue('manual', 'start', 'Work', item=7)
         state.finish(ident, 'succeeded', 'Preserved report')
         self.manager.sync_queue()
-        for status in ('removing', 'removed'):
+        for status in ('blocked', 'removing', 'removed'):
             with self.subTest(status=status):
+                saved = json.dumps(dict(state=status, reason='Historical cleanup record'))
                 with state.db:
                     state.set('monitor_issues', json.dumps({'7': {'state': 'CLOSED', 'checked': 1}}))
-                    state.db.execute('UPDATE tasks SET cleanup_json=?',
-                                     (json.dumps({'state': status, 'reason': 'Reconciliation result'}),))
+                    state.db.execute('UPDATE tasks SET cleanup_json=?', (saved,))
                 snapshot = monitor.snapshot(self.manager.directory)
-                self.assertEqual(len(snapshot['commands']), 1 if status == 'removing' else 0)
-                if status == 'removing':
-                    self.assertIn('Sprzątanie:', monitor.render(snapshot, width=120, height=30))
-                self.assertEqual(state.row(ident)['state'], 'succeeded')
+                self.assertEqual(snapshot['commands'], [])
+                self.assertEqual(snapshot['hidden_closed'], 1)
                 self.assertEqual(state.row(ident)['detail'], 'Preserved report')
+                self.assertEqual(state.db.execute('SELECT cleanup_json FROM tasks').fetchone()[0], saved)
+
+    def test_completion_closure_and_cancel_preserve_existing_development_environment(self):
+        _, state, _ = self.add_project('one', 1)
+        source = self.root / 'one'
+        (source / '.git/info/exclude').write_text('.dev-environment/\n')
+        environment = source / '.dev-environment'
+        environment.mkdir()
+        database = environment / 'database.txt'
+        database.write_text('existing local data')
+        self.comment('example/one', 101)
+        self.tick()
+        self.assertEqual(state.row(1)['state'], 'succeeded')
+        task = state.db.execute('SELECT * FROM tasks').fetchone()
+        # Historical cleanup data must remain inert even when GitHub closes the issue.
+        proof = json.dumps(dict(repo=str(source), cwd=str(source), branch=task['branch']))
+        old_cleanup = json.dumps(dict(state='blocked', reason='Legacy cleanup error'))
+        with state.db:
+            state.db.execute('UPDATE tasks SET automatic_json=?,cleanup_json=?', (proof, old_cleanup))
+        self.item_states = {7: 'CLOSED'}
+        with patch.object(b, 'git', side_effect=AssertionError('Closure attempted a Git operation')), \
+                patch.object(subprocess, 'run', side_effect=AssertionError('Closure attempted a runtime operation')):
+            self.manager.refresh_issue_states()
+            ident = self.manager.enqueue('example/one', task['name'], 'continue', 'read')
+            self.manager.control('cancel', str(ident))
+        self.assertEqual(state.row(2)['state'], 'cancelled')
+        self.assertEqual(database.read_text(), 'existing local data')
+        saved = state.db.execute('SELECT * FROM tasks').fetchone()
+        self.assertEqual(saved['thread_id'], task['thread_id'])
+        self.assertEqual(saved['cleanup_json'], old_cleanup)
+        self.assertEqual(saved['automatic_json'], proof)
+        branch = subprocess.check_output(['git', '-C', str(source), 'branch', '--show-current'], text=True).strip()
+        self.assertEqual(branch, task['branch'])
 
     def test_successful_cleanup_reason_does_not_hide_failed_continuation_or_owner_question(self):
         _, state, _ = self.add_project('one', 1)
@@ -677,23 +684,6 @@ class ManagerTests(unittest.TestCase):
                 rendered = monitor.render(monitor.snapshot(self.manager.directory), width=120, height=30)
                 self.assertIn(detail, rendered)
                 self.assertNotIn('Old cleanup result', rendered)
-
-    def test_cleanup_refresh_includes_all_aliases_and_passes_only_fresh_results(self):
-        from murphy import cleanup
-        _, state, worker = self.add_project('one', 1)
-        self.manager.register('example/one', 'manual', self.root / 'one', 'main', [7, 8])
-        ident = state.enqueue('manual', 'start', 'Work', item=7)
-        state.finish(ident, 'succeeded', 'Done')
-        with state.db:
-            state.db.execute('UPDATE tasks SET automatic_json=?', ('{"proof": "fixture"}',))
-        fresh = {'7': {'state': 'CLOSED'}, '8': {'state': 'OPEN'}}
-        with patch.object(worker.github, 'issue_states', return_value=fresh) as api, \
-                patch.object(cleanup, 'retire') as retire:
-            self.manager.refresh_issue_states()
-            self.assertEqual(api.call_args.args[0], [7, 8])
-            self.assertEqual(retire.call_args.args[2], fresh)
-            self.manager.refresh_issue_states()
-            self.assertEqual(retire.call_count, 1)
 
     def test_issue_status_refresh_batches_deduplicates_and_persists_ttl(self):
         _, state, worker = self.add_project('one', 1)
@@ -724,29 +714,6 @@ class ManagerTests(unittest.TestCase):
                 reopened.refresh_issue_states()
                 repeated.assert_not_called()
         self.assertTrue(all(row[0] == 'waiting_for_user' for row in state.db.execute('SELECT state FROM commands')))
-
-    def test_startup_cleanup_rechecks_recent_cache_and_previous_cleanup_failure(self):
-        _, state, worker = self.add_project('one', 1)
-        self.manager.register('example/one', 'manual', self.root / 'one', 'main', [7, 8])
-        ident = state.enqueue('manual', 'start', 'Work', item=7)
-        state.finish(ident, 'succeeded', 'Done')
-        with state.db:
-            state.db.execute('UPDATE tasks SET automatic_json=?,cleanup_json=?',
-                             ('{"proof":"fixture"}', json.dumps(dict(state='blocked', reason='old process error'))))
-            state.set('monitor_issues', json.dumps({str(number): dict(state='CLOSED', checked=9999, attempted=9999)
-                                                  for number in (7, 8)}))
-        fresh = {str(number): {'state': 'CLOSED'} for number in (7, 8)}
-        with patch.object(worker.github, 'issue_states', return_value=fresh) as api, \
-                patch.object(cleanup, 'retire') as retire, \
-                patch('murphy.manager.time.monotonic', return_value=0), \
-                patch('murphy.manager.time.time', return_value=10000):
-            self.manager.refresh_issue_states()
-            self.assertEqual(api.call_args.args[0], [7, 8])
-            self.assertEqual(retire.call_args.args[2:], (fresh, [7, 8]))
-            self.manager.refresh_issue_states()
-            self.assertEqual(api.call_count, 1)
-            self.assertEqual(retire.call_count, 1)
-        self.assertEqual(state.row(ident)['state'], 'succeeded')
 
     def test_issue_status_failures_back_off_and_retain_cache(self):
         _, state, worker = self.add_project('one', 1)
@@ -1243,7 +1210,7 @@ with patch.object(Account,'api',lambda account,*a,**kw: case.account_api(account
 
     def test_waiting_issue_survives_restart_and_answer_queues_behind_active_issue(self):
         _, state, _ = self.add_project('one', 1)
-        self.comment('example/one', 101, 'ASK_OWNER WRITE_TASK_FILE', item=7)
+        self.comment('example/one', 101, 'ASK_OWNER COMMIT_TASK_FILE', item=7)
         self.comment('example/one', 102, 'SLOW', item=8)
         self.tick()
         first = state.row(1)
@@ -1285,7 +1252,7 @@ with patch.object(Account,'api',lambda account,*a,**kw: case.account_api(account
         self.assertNotEqual(state.row(2)['thread_id'], first['thread_id'])
         self.assertGreaterEqual(reply['started'], state.row(2)['finished'])
         self.assertEqual(reply['task'], first['task'])
-        self.assertNotEqual(json.loads(first['plan'])['cwd'], json.loads(state.row(2)['plan'])['cwd'])
+        self.assertEqual(json.loads(first['plan'])['cwd'], json.loads(state.row(2)['plan'])['cwd'])
         cwd = Path(json.loads(first['plan'])['cwd'])
         self.assertEqual((cwd / 'task.txt').read_text(), 'task change\ntask change\n')
         self.assertEqual(self.manager.setting('paused'), '0')
@@ -1567,23 +1534,19 @@ with patch.object(Account,'api',lambda account,*a,**kw: case.account_api(account
         self.assertEqual(second.row(1)['state'], 'queued')
         self.assertFalse(b.descendants())
 
-    def test_managed_clone_uses_gh_and_does_not_reuse_existing_directory(self):
-        self.add_project('seed', 1)
-        repo = 'example/cloned'
-        self.repos[repo] = {'id': 2, 'full_name': repo, 'default_branch': 'main', 'permissions': {'push': True}}
-        self.comments[repo] = []
-        original = subprocess.run
-        def clone(args, **kwargs):
-            if args[:3] != [sys.executable, 'repo', 'clone']:
-                return original(args, **kwargs)
-            self.assertEqual(args[:4], [sys.executable, 'repo', 'clone', 'https://github.com/' + repo])
-            result = original(['git', 'clone', '-q', str(self.root / 'seed'), args[4]], check=True)
-            original(['git', '-C', args[4], 'remote', 'set-url', 'origin', 'https://github.com/' + repo], check=True)
-            return result
-        with patch.object(subprocess, 'run', side_effect=clone):
-            self.assertEqual(self.manager.add(repo), repo)
-        source = self.manager.directory / 'checkouts/2'
-        self.assertTrue((source / '.git').is_dir())
+    def test_project_connection_requires_existing_checkout_without_cloning(self):
+        self.project_source('one', 1)
+        with patch.object(subprocess, 'run') as run:
+            with self.assertRaisesRegex(ValueError, '--checkout PATH'):
+                self.manager.add('example/one')
+            run.assert_not_called()
+        self.assertEqual(self.manager.status()['projects'], [])
+        self.assertFalse((self.manager.directory / 'checkouts').exists())
+        argv = ['murphy', '--state-dir', str(self.manager.directory), 'projects', 'add', 'example/one']
+        with patch.object(sys, 'argv', argv), patch('sys.stderr', new_callable=io.StringIO):
+            with self.assertRaises(SystemExit) as error:
+                cli.main()
+        self.assertEqual(error.exception.code, 2)
 
     def test_single_branch_checkout_fetches_and_refreshes_explicit_task_base(self):
         self.add_project('seed', 1)
@@ -1621,7 +1584,7 @@ with patch.object(Account,'api',lambda account,*a,**kw: case.account_api(account
         self.assertEqual(state.row(1)['state'], 'succeeded', state.row(1)['detail'])
         self.assertEqual(state.row(1)['head'], expected)
         self.assertEqual(subprocess.check_output(['git', '-C', str(source), 'branch', '--show-current'],
-                                                 text=True).strip(), 'main')
+                                                 text=True).strip(), 'codex/issue-7-murphy')
         self.assertEqual((source / '.git/config').read_bytes(), original_config)
 
     def test_available_projects_and_missing_prerequisites(self):

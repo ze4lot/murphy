@@ -420,23 +420,23 @@ class State:
             self.set('since', latest['created_at'] if latest else now())
             self.set('paused', '0')
 
-    def configure_autostart(self, repo, worktrees, base='main', model=None, baseline=None):
+    def configure_autostart(self, repo, base='main', model=None, baseline=None):
         self.initialized()
         repo = str(Path(repo).resolve())
         info = checkout(repo)
         git(repo, 'check-ref-format', '--branch', base)
-        worktrees = Path(worktrees).resolve()
-        if worktrees == Path(repo) or Path(repo) in worktrees.parents:
-            raise ValueError('Automatic worktrees must be outside the source checkout')
         with self.db:
             if self.setting('autostart_baseline') is None:
                 self.set('autostart_baseline', baseline if baseline is not None else self.setting('baseline'))
             self.set('autostart', json.dumps({'repo': repo, 'common_dir': info['common_dir'],
-                     'worktrees': str(Path(worktrees).resolve()), 'base': base, 'model': model}))
+                     'base': base, 'model': model}))
 
     def register(self, name, cwd, branch, items=(), model=None, reasoning=None, issue=None):
         self.initialized()
         cwd = str(Path(cwd).resolve())
+        config = json.loads(self.setting('autostart') or 'null')
+        if config and cwd != config['repo']:
+            raise ValueError('Register tasks in the configured project checkout: ' + config['repo'])
         info = checkout(cwd)
         if info['branch'] != branch or info['dirty']:
             raise ValueError('Register a clean checkout on the explicit task branch')
@@ -532,7 +532,7 @@ def codex_home():
 def git(cwd, *args):
     return subprocess.check_output([CONFIG.git, '-C', cwd, *args], text=True, stderr=subprocess.PIPE,
                                    env=environment(CONFIG),
-                                   umask=0o022 if args[:2] == ('worktree', 'add') else -1).strip()
+                                   umask=0o022 if args[0] == 'switch' else -1).strip()
 
 
 def dirty_summary(cwd):
@@ -597,8 +597,7 @@ def ssh_control_directory(before):
 
 
 def permission_args(before):
-    # A linked worktree needs both its own index and the shared refs/objects writable.
-    # Giving access to the whole source checkout is unnecessary.
+    # Git metadata and this project's SSH sockets remain explicit writable paths.
     control_dir = str(ssh_control_directory(before))
     metadata = sorted({before['common_dir'], before['git_dir'], control_dir})
     filesystem = ', '.join(json.dumps(path) + ' = "write"' for path in metadata)
@@ -784,11 +783,6 @@ class Worker:
         return True
 
     def prepare_task(self, row):
-        binding = self.state.db.execute('SELECT task FROM items WHERE number=?', (row['item'],)).fetchone()
-        if binding:
-            with self.state.db:
-                self.state.db.execute('UPDATE commands SET task=? WHERE id=?', (binding['task'], row['id']))
-            return
         if row['verb'] != 'start':
             raise ValueError('No session is registered for this issue; use /murphy start first')
         config = json.loads(self.state.setting('autostart') or 'null')
@@ -803,9 +797,7 @@ class Worker:
         git(config['repo'], 'check-ref-format', '--branch', base)
         name = f'issue-{row["item"]}'
         branch = f'codex/issue-{row["item"]}-murphy'
-        cwd = Path(config['worktrees']) / name
-        if cwd.exists() or cwd.is_symlink():
-            raise ValueError('Automatic worktree path already exists; inspect/register it explicitly')
+        cwd = config['repo']
         plan = {'issue': issue, 'reasoning': effort, 'base': base, 'branch': branch,
                 'cwd': str(cwd), 'repo': config['repo'], 'model': config['model']}
         git(config['repo'], 'fetch', 'origin')
@@ -815,18 +807,16 @@ class Worker:
         if any(existing.match(ref) for ref in refs):
             raise ValueError('An issue branch already exists; inspect/register it instead of creating a replacement')
         git(config['repo'], 'rev-parse', '--verify', f'refs/remotes/origin/{base}^{{commit}}')
-        # Fetch is repeatable; branch/worktree creation is not. Persist before attempting either.
+        # Fetch is repeatable; branch creation/switching is not. Persist before changing Git.
         with self.state.db:
             self.state.db.execute("UPDATE commands SET state='running',started=?,plan=?,reasoning=? WHERE id=?",
                                   (now(), json.dumps(plan), effort, row['id']))
-        cwd.parent.mkdir(parents=True, exist_ok=True)
-        git(config['repo'], 'worktree', 'add', '-b', branch, str(cwd), f'refs/remotes/origin/{base}')
+        try:
+            git(cwd, 'switch', '--no-overwrite-ignore', '-c', branch, f'refs/remotes/origin/{base}')
+        except subprocess.CalledProcessError as error:
+            raise ValueError('Cannot create/switch task branch: ' + error.stderr.strip()) from error
         self.state.register(name, cwd, branch, [row['item']], config['model'], effort, issue)
         with self.state.db:
-            info = checkout(str(cwd))
-            self.state.db.execute('UPDATE tasks SET automatic_json=? WHERE name=?',
-                                  (json.dumps(dict(repo=config['repo'], cwd=str(cwd), branch=branch,
-                                                   common_dir=info['common_dir'], git_dir=info['git_dir'])), name))
             self.state.db.execute('UPDATE commands SET task=? WHERE id=?', (name, row['id']))
 
     def block_dirty_source(self, row):
@@ -841,7 +831,7 @@ class Worker:
         if (task and task['cwd'] == source and task['checkout_json']
                 and checkout(source) == json.loads(task['checkout_json'])):
             return False  # A registered source can also be this task's own checkpoint.
-        detail = ('Source checkout contains uncommitted changes. No model or task worktree was started.\n\n'
+        detail = ('Source checkout contains uncommitted changes. No model was started or branch switched.\n\n'
                   'Commit, stash or remove these changes yourself, then run `murphy resume` '
                   'or post `/murphy resume`. The shared queue stays paused until you resume it.\n\n' + summary)
         if len(detail) > 2200:
@@ -849,6 +839,33 @@ class Worker:
         self.state.block(row['id'], detail)
         print(detail, file=sys.stderr)
         return True
+
+    def task_checkout(self, row, task):
+        before = checkout(task['cwd'])
+        expected = json.loads(task['checkout_json']) if task['checkout_json'] else None
+        if before['common_dir'] != task['common_dir']:
+            raise ValueError('Task repository identity changed')
+        if before['branch'] != task['branch']:
+            if before['dirty'] or not expected or expected['dirty']:
+                raise ValueError('Cannot switch to the task branch: checkout must be clean and '
+                                 'the saved task checkpoint must contain no uncommitted changes')
+            head = git(task['cwd'], 'rev-parse', '--verify', f'refs/heads/{task["branch"]}^{{commit}}')
+            if head != expected['head']:
+                raise ValueError('Task branch differs from the saved checkpoint; external commits preserved')
+            with self.state.db:
+                self.state.db.execute("UPDATE commands SET state='running',started=COALESCE(started,?),"
+                                      'plan=COALESCE(plan,?) WHERE id=?',
+                                      (now(), json.dumps(dict(cwd=task['cwd'], branch=task['branch'],
+                                                             previous=before)), row['id']))
+            try:
+                git(task['cwd'], 'switch', '--no-overwrite-ignore', task['branch'])
+            except subprocess.CalledProcessError as error:
+                raise ValueError('Cannot switch to task branch ' + task['branch'] + ': ' + error.stderr.strip()) from error
+            before = checkout(task['cwd'])
+        if ((expected is not None and before != expected) or (expected is None and before['dirty'])):
+            raise ValueError('Checkout differs from the saved task checkpoint; external changes preserved, '
+                             'no stash/reset allowed\n\n' + dirty_summary(task['cwd']))
+        return before
 
     def execute(self, row, fd):
         if self.stop or self.state.row(row['id'])['cancel']:
@@ -859,6 +876,20 @@ class Worker:
         except Exception as error:
             # Deletion, edit, or unavailable API: no model, no guessed authorization.
             self.state.finish(row['id'], 'cancelled', 'Source could not be revalidated: ' + str(error))
+            return
+        # Comments may have been queued before the first start registered their issue.
+        if row['task'] is None and row['item'] is not None:
+            binding = self.state.db.execute('SELECT task FROM items WHERE number=?', (row['item'],)).fetchone()
+            if binding:
+                with self.state.db:
+                    self.state.db.execute('UPDATE commands SET task=? WHERE id=?', (binding['task'], row['id']))
+                row = self.state.row(row['id'])
+        task = self.state.db.execute('SELECT * FROM tasks WHERE name=?', (row['task'],)).fetchone()
+        config = json.loads(self.state.setting('autostart') or 'null')
+        if task and config and task['cwd'] != config['repo']:
+            self.state.finish(row['id'], 'failed', 'Saved task uses a legacy checkout: ' + task['cwd']
+                              + '. History and files retained. Inspect and migrate this task to the configured '
+                              'project checkout before continuing: ' + config['repo'])
             return
         try:
             if self.block_dirty_source(row):
@@ -885,12 +916,7 @@ class Worker:
         try:
             if task['host'] != socket.gethostname() or task['codex_home'] != codex_home():
                 raise ValueError('Task host/Codex home changed')
-            before = checkout(task['cwd'])
-            expected = json.loads(task['checkout_json']) if task['checkout_json'] else None
-            if (before['branch'] != task['branch'] or before['common_dir'] != task['common_dir']
-                    or (expected is not None and before != expected) or (expected is None and before['dirty'])):
-                raise ValueError('Checkout differs from the saved task checkpoint; external changes preserved, '
-                                 'no switch/stash/reset allowed\n\n' + dirty_summary(task['cwd']))
+            before = self.task_checkout(row, task)
         except Exception as error:
             self.state.finish(row['id'], 'unknown', str(error))
             return
@@ -928,12 +954,13 @@ class Worker:
         if task['thread_id']:
             args += ['resume', task['thread_id']]
         args += ['--output-schema', str(schema_path), '-']
-        prompt = ('Carry out the authenticated owner task in this assigned worktree. You may edit project files, '
+        prompt = ('Carry out the authenticated owner task in this configured local project checkout. You may edit project files, '
                   'run relevant tests, commit, push the task branch, and open or update its pull request when the task calls for it. '
                   "Follow this repository's AGENTS.md and use its configured agent identity. "
                   'Stay on the registered task branch; preserve unrelated changes. Do not merge, deploy, publish releases, '
                   'change authentication or touch other projects unless the owner explicitly requested that scope. '
-                  'Do not leave background processes running. Earlier bridge-added read-only pilot restrictions are retired; '
+                  'Do not leave task-owned background command processes running. Leave the user\'s development services running. '
+                  'Earlier bridge-added read-only pilot restrictions are retired; '
                   'honor any explicit read-only instructions from the owner.\n\n'
                   'For long-running QA commands or commits running hooks, run the existing repository command and '
                   'wait for completion using the command/session waiting mechanism, with suitably long waits on the '
@@ -943,10 +970,14 @@ class Worker:
                   'relevant stderr or log excerpt and fix the cause. Additional progress inspection is appropriate '
                   'for a suspected stall, timeout or failure diagnosis. Receiving further output from the active '
                   'command session is allowed; a missing final result or log text alone is never evidence of PASS.\n\n'
-                  'Use a separate Compose project with this worktree as its project working directory. '
-                  'Label standalone task containers and private networks/volumes with the container cleanup label below. '
-                  'Closing the original issue removes these task resources, including running containers. '
-                  'Do not assign the task label to shared services or resources.\n\n'
+                  'Work directly in this checkout and use the user\'s existing local development environment: '
+                  'Docker Compose project, containers, networks, volumes and the same local development database. '
+                  'Normal local development database operations, including migrations, writes and test data, are authorized '
+                  'within the assigned task. Do not create a per-task worktree, clone, Compose project, database, '
+                  'network, volume, isolation wrapper or cleanup label. Use the repository\'s existing QA commands; '
+                  'test services required by those commands are allowed. Task completion, cancellation or issue closure '
+                  'does not authorize stopping or deleting the user\'s development environment. '
+                  'Production operations require a separately requested deployment scope.\n\n'
                   'OpenSSH ControlMaster sockets may use ${MURPHY_SSH_CONTROL_DIR}/%C; this private project directory '
                   'is writable in the sandbox. Use ControlMaster auto and a finite ControlPersist (for example 60), '
                   'with the existing authorized host/user and host-key checking. Do not start a manual SSH master '
@@ -968,7 +999,6 @@ class Worker:
                   'Use message for the human-readable question or completion report.\n\n'
                   + 'Configured Git executable: ' + json.dumps(CONFIG.git)
                   + '\nConfigured GitHub CLI executable: ' + json.dumps(CONFIG.gh)
-                  + '\nContainer cleanup label: io.murphy.worktree=' + task['cwd']
                   + '\nRegistered branch: ' + task['branch'] + '\n\nOwner command:\n' + row['prompt'])
         if not task['thread_id'] and task['issue_json']:
             issue = json.loads(task['issue_json'])
@@ -1122,7 +1152,6 @@ def main():
     register.add_argument('--reasoning', choices=EFFORTS, help='Reasoning effort for the new task (default: high)')
     autostart = sub.add_parser('configure-autostart', help='One-time repository setup; new issue starts then need no manual registration')
     autostart.add_argument('--repo', required=True)
-    autostart.add_argument('--worktrees')
     autostart.add_argument('--base', default='main')
     autostart.add_argument('--model')
     ingest = sub.add_parser('ingest-comment', help='Fetch one explicit comment through the same activation/auth/dedup gates')
@@ -1160,8 +1189,7 @@ def main():
             github = GitHub()
             github.identity()
             latest = github.latest()
-            state.configure_autostart(args.repo, args.worktrees or state.directory / 'worktrees',
-                                      args.base, args.model, latest['id'] if latest else 0)
+            state.configure_autostart(args.repo, args.base, args.model, latest['id'] if latest else 0)
         elif args.action == 'ingest-comment':
             github = GitHub()
             github.identity()

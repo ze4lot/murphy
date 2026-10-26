@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Run all issue branches and persistent sessions in the configured local project checkout, using the existing development Compose services and database.
+- Require `projects add --checkout PATH`; stop creating managed clones, task worktrees and per-session environments.
+- Switch back to saved task branches only from a clean checkout with an unchanged task commit; preserve resumable task edits and report conflicting local changes.
+- Remove automatic worktree and Docker/Podman resource cleanup. Preserve legacy worktrees and sessions for explicit migration; old paths never silently execute on continuation.
+
 ## 0.1.0 — 2026-10-18 (experimental)
 
 - Installable `murphy` command and Python distribution with no runtime dependencies.
